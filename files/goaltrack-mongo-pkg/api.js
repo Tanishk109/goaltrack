@@ -134,4 +134,4 @@ const Admin = {
   },
 };
 
-if (typeof module !== 'undefined') module.exports = { Auth, Goals, Achievements, CheckIns, Admin };
+if (typeof module !== 'undefined') module.exports = { Auth, Goals, CheckIns, Achievements, Admin };

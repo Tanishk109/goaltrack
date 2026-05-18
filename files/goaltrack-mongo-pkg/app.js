@@ -9,7 +9,7 @@ let goals = [];
 let rawGoals = [];
 let totalWeightage = 0;
 let activeCycle = null;
-let currentQuarter = 'Q1';
+let currentQuarter = null;
 let achieveId = null;
 let editGoalId = null;
 let reportData = [];
@@ -23,6 +23,9 @@ let adminUnlockRequestsShowAll = false;
 /** Goal IDs with a pending unlock request (employee). */
 let pendingUnlockGoalIds = new Set();
 let appNotifications = [];
+let lastAnalyticsData = null;
+let checkinSchedulePhases = [];
+let currentCheckinPhase = null;
 
 async function loadCheckinsForEmployees(empIds, { force = false } = {}) {
   const ids = [...new Set(empIds.map((id) => String(id)).filter(Boolean))];
@@ -125,18 +128,37 @@ function cycleQuarterOpen(cycle, quarter) {
 }
 
 function inferCurrentQuarter(cycle) {
-  if (!cycle) return 'Q1';
+  if (!cycle) return null;
   const now = Date.now();
-  for (const q of ['Q4', 'Q3', 'Q2', 'Q1']) {
+
+  let latestQuarter = null;
+  let latestOpenTime = -1;
+  for (const q of ['Q1', 'Q2', 'Q3', 'Q4']) {
     const open = cycleQuarterOpen(cycle, q);
-    if (open && now >= open.getTime()) return q;
+    if (open && now >= open.getTime() && open.getTime() > latestOpenTime) {
+      latestQuarter = q;
+      latestOpenTime = open.getTime();
+    }
   }
+  if (latestQuarter) return latestQuarter;
+
+  const goalOpen = cycle.goalOpenDate ? new Date(cycle.goalOpenDate).getTime() : null;
+  const goalClose = cycle.goalCloseDate ? new Date(cycle.goalCloseDate).getTime() : null;
+  if (goalOpen && now >= goalOpen && goalClose && now <= goalClose) return 'Q1';
+  if (goalOpen && now < goalOpen) return 'Q1';
+
+  const q1Open = cycleQuarterOpen(cycle, 'Q1');
+  if (goalClose && now > goalClose && (!q1Open || now < q1Open.getTime())) return 'Q1';
+
   return 'Q1';
 }
 
 function isQuarterWindowOpen(cycle, quarter) {
   const open = cycleQuarterOpen(cycle, quarter);
-  return !!(open && Date.now() >= open.getTime());
+  if (open) return Date.now() >= open.getTime();
+  if (inferCurrentQuarter(cycle) !== quarter) return false;
+  const goalClose = cycle?.goalCloseDate ? new Date(cycle.goalCloseDate).getTime() : null;
+  return goalClose != null && Date.now() > goalClose;
 }
 
 function getPreviousQuarter(q) {
@@ -165,7 +187,9 @@ async function ensureActiveCycle() {
 
 /** Query params for Achievements.team — always scoped to active cycle when available. */
 function teamAchievementsParams(overrides = {}) {
-  const params = { quarter: currentQuarter, ...overrides };
+  const params = { ...overrides };
+  const quarter = overrides.quarter !== undefined ? overrides.quarter : currentQuarter;
+  if (quarter) params.quarter = quarter;
   const cycleId = activeCycle?._id || activeCycle?.id;
   if (cycleId) params.cycle_id = cycleId;
   return params;
@@ -224,7 +248,211 @@ function updateTopbarCycle() {
 
 function updateAchievementSummaryTitle() {
   const el = document.getElementById('employeeAchievementSummaryTitle');
-  if (el) el.textContent = `📊 ${currentQuarter} Achievement Summary`;
+  if (!el) return;
+  if (currentCheckinPhase === 'goal_setting' || isGoalSettingPhase(activeCycle, currentSheet)) {
+    el.textContent = '📊 Goal Setting';
+  } else if (currentQuarter) {
+    el.textContent = `📊 ${currentQuarter} Achievement Summary`;
+  } else {
+    el.textContent = '📊 Achievement Summary';
+  }
+}
+
+// ─── Check-in campaigns (CheckIns API) ───────────────────────────────────────
+function timelineDotClass(runtimeStatus) {
+  if (runtimeStatus === 'launched_active' || runtimeStatus === 'open') return 'current';
+  if (runtimeStatus === 'past' || runtimeStatus === 'launched_closed') return 'done';
+  return 'upcoming';
+}
+
+function renderCycleTimelineFromSchedule(phases) {
+  const container = document.getElementById('checkinTimeline');
+  if (!container) return;
+  if (!phases?.length) {
+    container.innerHTML = '<p style="color:var(--text-muted);padding:8px">No schedule configured for this cycle.</p>';
+    return;
+  }
+  container.innerHTML = phases.map((phase) => {
+    const dotCls = timelineDotClass(phase.runtimeStatus);
+    const opens = phase.windowOpens
+      ? new Date(phase.windowOpens).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })
+      : 'Date not set';
+    const active = phase.runtimeStatus === 'launched_active' || phase.runtimeStatus === 'open';
+    const launched = phase.launched ? ' · <strong style="color:var(--accent)">Launched</strong>' : '';
+    const closedLabel = phase.period?.status === 'closed'
+      ? ' · <span style="color:var(--success)">Completed</span>'
+      : '';
+    const activeNow = active ? ' · <strong style="color:var(--accent)">Active Now</strong>' : '';
+    return `<div class="timeline-item">
+      <div class="timeline-dot ${dotCls}"></div>
+      <div><h4>${esc(phase.label)}</h4><p>${opens}${launched}${closedLabel}${activeNow}</p></div>
+    </div>`;
+  }).join('');
+}
+
+async function loadCheckinSchedule() {
+  const container = document.getElementById('checkinTimeline');
+  try {
+    await ensureActiveCycle();
+    const cycleId = activeCycle?._id || activeCycle?.id;
+    if (!cycleId) {
+      if (container) container.innerHTML = '<p style="color:var(--text-muted);padding:8px">No active cycle.</p>';
+      return;
+    }
+    const data = await CheckIns.schedule(cycleId);
+    checkinSchedulePhases = data.phases || [];
+    if (data.cycle) activeCycle = data.cycle;
+    if (data.currentQuarter) currentQuarter = data.currentQuarter;
+    currentCheckinPhase = data.currentPhase || null;
+    renderCycleTimelineFromSchedule(checkinSchedulePhases);
+    updateTopbarCycle();
+    updateAchievementSummaryTitle();
+  } catch (err) {
+    if (container && activeCycle) renderCycleTimeline(activeCycle);
+    else if (container) {
+      container.innerHTML = `<p style="color:var(--text-muted);padding:8px">${esc(err.message || 'Unable to load schedule')}</p>`;
+    }
+  }
+}
+
+async function renderEmployeeCheckinTasks() {
+  const alert = document.getElementById('employeeCheckinTasksAlert');
+  const list = document.getElementById('employeeCheckinTasksList');
+  if (!alert || !list || currentRole !== 'employee') return;
+  try {
+    const { assignments } = await CheckIns.myAssignments();
+    if (!assignments?.length) {
+      alert.style.display = 'none';
+      return;
+    }
+    alert.style.display = 'flex';
+    list.innerHTML = assignments.map((a) => {
+      const p = a.period;
+      const title = p?.title || p?.phase || 'Check-in';
+      const deadline = p?.deadline ? fmtDate(p.deadline) : '—';
+      const overdue = a.status === 'overdue';
+      return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-top:1px solid var(--border)">
+        <span><strong>${esc(title)}</strong>${overdue ? ' <span style="color:var(--danger)">(overdue)</span>' : ''} — due ${deadline}</span>
+        <button class="btn btn-warning btn-sm" onclick="navigateTo('employee-dashboard')">Complete →</button>
+      </div>`;
+    }).join('');
+  } catch {
+    alert.style.display = 'none';
+  }
+}
+
+function renderCheckinPeriodsTables(enriched) {
+  const rows = enriched || [];
+  ['checkinPeriodsTable', 'adminCheckinPeriodsTable'].forEach((tableId) => {
+    const tbody = document.getElementById(tableId);
+    if (!tbody) return;
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">No check-in rounds launched yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(({ period: p, stats }) => {
+      const progress = stats?.total
+        ? `${stats.submitted || 0}/${stats.total} submitted`
+        : '—';
+      const statusCls = p.status === 'active' ? 'status-approved' : 'status-draft';
+      const closeBtn = p.status === 'active'
+        ? `<button class="btn btn-outline btn-sm" onclick="closeCheckinPeriod('${escAttr(String(p._id || p.id))}')">Close</button>`
+        : '';
+      return `<tr>
+        <td><strong>${esc(p.title || p.phase)}</strong></td>
+        <td>${p.launchedAt ? fmtDate(p.launchedAt) : '—'}</td>
+        <td>${p.deadline ? fmtDate(p.deadline) : '—'}</td>
+        <td>${progress}</td>
+        <td><span class="status-badge ${statusCls}">${esc(p.status)}</span></td>
+        <td>${closeBtn}</td>
+      </tr>`;
+    }).join('');
+  });
+}
+
+async function loadCheckinPeriods() {
+  if (currentRole !== 'manager' && currentRole !== 'admin') return;
+  try {
+    await ensureActiveCycle();
+    const cycleId = activeCycle?._id || activeCycle?.id;
+    const { periods } = await CheckIns.periods(cycleId);
+    renderCheckinPeriodsTables(periods);
+  } catch {
+    renderCheckinPeriodsTables([]);
+  }
+}
+
+async function openLaunchCheckinModal() {
+  const errEl = document.getElementById('launchCheckinError');
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+  await loadCheckinSchedule();
+  const sel = document.getElementById('launchCheckinPhase');
+  const hint = document.getElementById('launchPhaseHint');
+  if (!sel) return;
+  const launchable = (checkinSchedulePhases || []).filter(
+    (p) => p.configured
+      && p.runtimeStatus !== 'launched_active'
+      && p.calendarStatus !== 'upcoming'
+      && (p.calendarStatus !== 'past' || p.phase === 'Q4'),
+  );
+  if (!launchable.length) {
+    sel.innerHTML = '<option value="">No phases available to launch</option>';
+    if (hint) hint.textContent = 'Configure cycle dates or wait for the calendar window to open.';
+  } else {
+    sel.innerHTML = launchable.map((p) => `<option value="${escAttr(p.phase)}">${esc(p.label)}</option>`).join('');
+    onLaunchPhaseChange();
+  }
+  showModal('launchCheckinModal');
+}
+
+function onLaunchPhaseChange() {
+  const phase = document.getElementById('launchCheckinPhase')?.value;
+  const hint = document.getElementById('launchPhaseHint');
+  const deadlineInput = document.getElementById('launchCheckinDeadline');
+  const row = checkinSchedulePhases.find((p) => p.phase === phase);
+  if (hint && row) {
+    hint.textContent = row.action || '';
+  }
+  if (deadlineInput && row?.suggestedDeadline) {
+    const d = new Date(row.suggestedDeadline);
+    deadlineInput.value = d.toISOString().slice(0, 10);
+  }
+}
+
+async function submitLaunchCheckin() {
+  const errEl = document.getElementById('launchCheckinError');
+  const phase = document.getElementById('launchCheckinPhase')?.value;
+  const deadline = document.getElementById('launchCheckinDeadline')?.value;
+  if (!phase) {
+    if (errEl) { errEl.textContent = 'Select a check-in phase.'; errEl.style.display = 'block'; }
+    return;
+  }
+  try {
+    await ensureActiveCycle();
+    const cycleId = activeCycle?._id || activeCycle?.id;
+    const res = await CheckIns.launch({ cycle_id: cycleId, phase, deadline: deadline || undefined });
+    showToast(res.message || 'Check-in launched.', 'success');
+    closeModal('launchCheckinModal');
+    await loadCheckinSchedule();
+    await loadCheckinPeriods();
+    if (currentRole === 'manager') await loadManagerDashboard({ silent: true });
+    if (currentRole === 'admin') await loadAdminDashboard({ silent: true });
+  } catch (err) {
+    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
+    else showToast(err.message, 'danger');
+  }
+}
+
+async function closeCheckinPeriod(periodId) {
+  if (!periodId) return;
+  try {
+    const res = await CheckIns.closePeriod(periodId);
+    showToast(res.message || 'Period closed.', 'success');
+    await loadCheckinPeriods();
+    await loadCheckinSchedule();
+  } catch (err) {
+    showToast(err.message, 'danger');
+  }
 }
 
 function timelinePhaseState(startDate, endDate, { forceDone = false } = {}) {
@@ -244,26 +472,8 @@ function renderCycleTimeline(cycle) {
     currentQuarter = inferCurrentQuarter(cycle);
   }
 
-  const chip = document.getElementById('topbarCycle');
-  if (chip && cycle) {
-    const now = new Date();
-    const windows = [
-      { q: 'Q1', open: cycle.q1Open },
-      { q: 'Q2', open: cycle.q2Open },
-      { q: 'Q3', open: cycle.q3Open },
-      { q: 'Q4', open: cycle.q4Open },
-    ];
-    const active = windows.filter((w) => w.open && new Date(w.open) <= now).pop();
-    chip.textContent = active
-      ? `${active.q} Check-in — ${new Date(active.open).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}`
-      : cycle.name;
-  }
-
-  const summaryTitle = document.getElementById('employeeAchievementSummaryTitle')
-    || document.querySelector('#pg-employee-dashboard .card-title');
-  if (summaryTitle && summaryTitle.textContent.includes('Achievement Summary')) {
-    summaryTitle.textContent = `📊 ${currentQuarter} Achievement Summary`;
-  }
+  updateTopbarCycle();
+  updateAchievementSummaryTitle();
 
   const items = document.querySelectorAll('#checkinTimeline .timeline-item');
   if (!items.length || !cycle) return;
@@ -374,7 +584,7 @@ async function refreshNotifications() {
       });
     }
     const pending = countPendingCheckins(activeCycle, currentSheet?.status, rawGoals);
-    if (pending > 0) {
+    if (pending > 0 && currentQuarter) {
       items.push({
         id: `pending-checkins-${currentQuarter}`,
         title: `${pending} pending check-in${pending > 1 ? 's' : ''}`,
@@ -382,6 +592,19 @@ async function refreshNotifications() {
         page: 'employee-dashboard',
       });
     }
+    try {
+      const { assignments } = await CheckIns.myAssignments();
+      (assignments || []).forEach((a) => {
+        const p = a.period;
+        items.push({
+          id: `checkin-assign-${normalizeId(a._id || a.id)}`,
+          title: p?.title || 'Check-in due',
+          body: `Complete by ${p?.deadline ? fmtDate(p.deadline) : 'deadline'}.`,
+          page: 'employee-dashboard',
+          time: p?.deadline,
+        });
+      });
+    } catch { /* optional */ }
     try {
       const { requests } = await Goals.myUnlockRequests();
       requests
@@ -554,10 +777,12 @@ async function refreshEmployeeData({ silent = false } = {}) {
   );
   if (cycleRes.cycle) activeCycle = cycleRes.cycle;
   currentQuarter = inferCurrentQuarter(activeCycle);
+  updateAchievementSummaryTitle();
   if (silent) notifySheetStatusChange(prevStatus);
   renderSheetStatusBadge();
   renderSheetReturnNote();
-  renderCycleTimeline(cycleRes.cycle || activeCycle);
+  await loadCheckinSchedule();
+  await renderEmployeeCheckinTasks();
   renderEmployeeStats();
   renderGoals();
   renderAchievements();
@@ -674,6 +899,14 @@ function canEditGoalDefinition(g) {
 
 function hasPendingUnlockRequest(goalId) {
   return pendingUnlockGoalIds.has(normalizeId(goalId));
+}
+
+/** Employee may request admin unlock when sheet is approved and goal is not editable. */
+function employeeCanRequestUnlock(g) {
+  if (currentRole !== 'employee' || currentSheet?.status !== 'approved') return false;
+  if (hasPendingUnlockRequest(g.id)) return false;
+  if (canEditGoalDefinition(g)) return false;
+  return isGoalLocked(g, 'approved');
 }
 
 function unlockRequestActionHtml(goalId, goalTitle) {
@@ -972,6 +1205,7 @@ async function loadEmployeeDashboard({ silent = false } = {}) {
   } finally {
     if (!silent) setAddGoalButtonsLoading(false);
   }
+  renderEmployeeCheckinTasks().catch(() => {});
 }
 
 async function loadEmployeeData(pageId) {
@@ -1015,7 +1249,7 @@ function renderSheetReturnNote() {
 function renderEmployeeStats() {
   const grid = document.querySelector('#pg-employee-dashboard .stats-grid');
   if (!grid) return;
-  const pendingCheckins = goals.filter((g) => g.locked && g.achievement === '—').length;
+  const pendingCheckins = countPendingCheckins(activeCycle, currentSheet?.status, rawGoals);
   const avg = goals.length ? Math.round(goals.reduce((s, g) => s + getScore(g), 0) / goals.length) : 0;
   const vals = [goals.length, avg + '%', pendingCheckins, totalWeightage + '%'];
   grid.querySelectorAll('.stat-value').forEach((el, i) => { if (vals[i] != null) el.textContent = vals[i]; });
@@ -1026,9 +1260,14 @@ function renderGoals() {
   const list = document.getElementById('myGoalsList');
   const table = document.getElementById('goalsTable');
   const editable = canEditGoals();
+  const qOpen = isQuarterWindowOpen(activeCycle, currentQuarter);
 
   if (list) {
-    list.innerHTML = goals.length ? goals.map((g) => `
+    list.innerHTML = goals.length ? goals.map((g) => {
+      const updateBtn = qOpen
+        ? `<button class="btn btn-outline btn-sm" onclick="openAchieve('${normalizeId(g.id)}')">Update progress</button>`
+        : `<span style="font-size:12px;color:var(--text-muted)">Check-in opens ${fmtMonthYear(cycleQuarterOpen(activeCycle, currentQuarter))}</span>`;
+      return `
       <div class="goal-item">
         <div class="goal-item-header">
           <div>
@@ -1051,7 +1290,7 @@ function renderGoals() {
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;flex-wrap:wrap;gap:6px">
             <span class="status-badge status-${g.achStatus}">${g.achStatus.replace('-', ' ')}</span>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
-            <button class="btn btn-outline btn-sm" onclick="openAchieve('${normalizeId(g.id)}')">Update progress</button>
+            ${updateBtn}
             ${canEditGoalDefinition(g) ? `<button class="btn btn-primary btn-sm" onclick="openEditGoal('${normalizeId(g.id)}')">Edit goal</button>` : ''}
             </div>
           </div>
@@ -1059,7 +1298,7 @@ function renderGoals() {
      currentSheet?.status === 'submitted' ? 'Submitted — waiting for manager approval' :
      currentSheet?.status === 'approved' ? 'Approved and locked' :
      'Waiting for manager approval'}</div>`}
-        ${g.locked && currentRole === 'employee'
+        ${employeeCanRequestUnlock(g)
     ? `<span class="chip orange" style="font-size:11px;margin-top:4px;display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px">
          🔒 Goal locked
          ${unlockRequestActionHtml(g.id, g.title)}
@@ -1067,7 +1306,8 @@ function renderGoals() {
     : canEditGoalDefinition(g) && currentRole === 'employee'
     ? '<span class="chip green" style="font-size:11px;margin-top:4px">🔓 Unlocked for edits</span>'
     : ''}
-      </div>`).join('') : '<div class="empty-state"><i class="fa fa-bullseye"></i><p>No goals yet. Add your first goal!</p></div>';
+      </div>`;
+    }).join('') : '<div class="empty-state"><i class="fa fa-bullseye"></i><p>No goals yet. Add your first goal!</p></div>';
   }
 
   if (table) {
@@ -1075,15 +1315,13 @@ function renderGoals() {
       const gid = normalizeId(g.id);
       const canEdit = canEditGoalDefinition(g) || (editable && !g.locked);
       const canDel = editable && !g.locked && !g.isShared;
-      const unlockBtn = g.locked
-        ? currentRole === 'admin'
+      const unlockBtn = employeeCanRequestUnlock(g)
+        ? unlockRequestActionHtml(gid, g.title)
+        : g.locked && currentRole === 'admin'
           ? `<button class="btn btn-warning btn-sm" onclick="unlockGoal('${gid}')"><i class="fa fa-lock-open"></i> Unlock</button>`
-          : currentRole === 'employee'
-            ? unlockRequestActionHtml(gid, g.title)
-            : ''
-        : currentRole === 'admin' && currentSheet?.status === 'approved'
-          ? `<button class="btn btn-outline btn-sm" onclick="lockGoal('${gid}')"><i class="fa fa-lock"></i> Lock</button>`
-          : '';
+          : !g.locked && currentRole === 'admin' && currentSheet?.status === 'approved'
+            ? `<button class="btn btn-outline btn-sm" onclick="lockGoal('${gid}')"><i class="fa fa-lock"></i> Lock</button>`
+            : '';
       return `<tr>
         <td style="color:var(--text-muted)">${i + 1}</td>
         <td><span class="chip blue">${esc(g.thrust)}</span></td>
@@ -1487,6 +1725,7 @@ async function loadManagerDashboard({ silent = false } = {}) {
     const allCheckins = flatCheckinsForEmployees(empIds);
     allCheckins.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     renderCheckinComments(allCheckins.slice(0, 10));
+    await loadCheckinSchedule();
     if (!silent) showPageError('manager-dashboard', null);
   } catch (err) {
     if (!silent) {
@@ -1500,6 +1739,7 @@ async function loadManagerDashboard({ silent = false } = {}) {
       if (checkins) checkins.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
     }
   }
+  loadCheckinPeriods().catch(() => {});
 }
 
 function renderManagerStats(dash) {
@@ -1914,7 +2154,7 @@ async function loadAdminDashboard({ silent = false } = {}) {
   if (!silent) {
     showPageError('admin-dashboard', null);
     setContainersLoading([
-      { id: 'escalationsTable', cols: 4 },
+      { id: 'escalationsTable', cols: 5 },
       { id: 'auditTrailTable', cols: 4 },
       { id: 'completionTable', cols: 6 },
     ]);
@@ -1933,13 +2173,15 @@ async function loadAdminDashboard({ silent = false } = {}) {
     escalations = escRes.escalations || [];
     teamCheckins = teamRes.data || [];
     allUsers = usersRes.users || usersRes;
+    await loadCheckinSchedule();
+    await loadCheckinPeriods();
     if (!silent) showPageError('admin-dashboard', null);
   } catch (err) {
     if (!silent) {
       showPageError('admin-dashboard', err.message);
       showToast(err.message, 'danger');
       const esc = document.getElementById('escalationsTable');
-      if (esc) esc.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+      if (esc) esc.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
       const completion = document.getElementById('completionTable');
       if (completion) completion.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
     }
@@ -2086,6 +2328,9 @@ function renderAdminStats(dash, activeEscalations = 0, teamCheckins = []) {
   document.getElementById('checkinRateFill').style.width = checkinRate + '%';
   document.getElementById('checkinRateLabel').textContent = checkinRate + '%';
 
+  const labelEl = document.getElementById('checkinCompletionLabel');
+  if (labelEl) labelEl.textContent = `${currentQuarter || 'Q1'} Check-in Completion`;
+
   const alert = document.getElementById('adminNotSubmittedAlert');
   if (alert) {
     const n = s.notSubmitted ?? 0;
@@ -2161,7 +2406,7 @@ function renderEscalations(list) {
   const tbody = document.getElementById('escalationsTable');
   if (!tbody) return;
   if (!list.length) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">No escalations</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">No escalations</td></tr>';
     return;
   }
   tbody.innerHTML = list.map((e) => {
@@ -2169,12 +2414,16 @@ function renderEscalations(list) {
     const statusCls = resolved ? 'status-approved' : 'status-pending';
     const statusLabel = resolved ? 'Resolved' : 'Open';
     return `<tr>
-      <td><strong>${esc(e.user?.name || '—')}</strong></td>
+      <td>
+        <strong>${esc(e.user?.name || '—')}</strong>
+        <div style="font-size:11px;color:var(--text-muted)">${esc(e.user?.department || '')}</div>
+      </td>
       <td><span class="status-badge status-pending">${esc((e.type || '').replace(/_/g, ' '))}</span></td>
+      <td style="font-size:13px">${esc(e.managerName || '—')}</td>
       <td><span class="status-badge ${statusCls}">${statusLabel}</span></td>
       <td>${resolved ? '—' : `<div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn btn-outline btn-sm" onclick="remindEscalation('${e._id}')">Remind</button>
-        <button class="btn btn-outline btn-sm" onclick="resolveEscalation('${e._id}')">Resolve</button>
+        <button class="btn btn-outline btn-sm" onclick="remindEscalation('${normalizeId(e._id || e.id)}')">Remind</button>
+        <button class="btn btn-outline btn-sm" onclick="resolveEscalation('${normalizeId(e._id || e.id)}')">Resolve</button>
       </div>`}</td>
     </tr>`;
   }).join('');
@@ -2294,7 +2543,9 @@ async function loadCycleConfig() {
   if (status) status.innerHTML = LOADING_HTML;
   try {
     const { cycle } = await Admin.activeCycle();
+    activeCycle = cycle;
     populateCycleForm(cycle);
+    await loadCheckinSchedule();
     if (status) status.innerHTML = '';
   } catch (err) {
     showPageError('cycle-config', err.message);
@@ -2651,43 +2902,182 @@ function exportReportExcel() {
 }
 
 // ─── Analytics ───────────────────────────────────────────────────────────────
+const ANALYTICS_QUARTERS = ['Q1', 'Q2', 'Q3', 'Q4'];
+
+function syncAnalyticsQuarterUi() {
+  const sel = document.getElementById('analyticsQuarter');
+  if (sel && sel.value !== currentQuarter) sel.value = currentQuarter || 'Q1';
+}
+
+function setAnalyticsRoleVisibility() {
+  const isEmployee = currentRole === 'employee';
+  const qoqLevel = document.getElementById('qoqLevel');
+  if (qoqLevel) qoqLevel.style.display = isEmployee ? 'none' : '';
+  document.querySelectorAll('#pg-analytics .two-col').forEach((el) => {
+    el.style.display = isEmployee ? 'none' : '';
+  });
+  const mgrCard = document.getElementById('managerEffectivenessTable')?.closest('.card');
+  if (mgrCard) mgrCard.style.display = isEmployee ? 'none' : '';
+  const quarterBar = document.getElementById('analyticsQuarter')?.parentElement;
+  if (quarterBar) quarterBar.style.display = isEmployee ? 'none' : '';
+  const orgStats = document.getElementById('analyticsOrgStats');
+  if (orgStats) orgStats.style.display = isEmployee ? 'none' : '';
+}
+
 function renderManagerEffectivenessPlaceholder() {
   const tbody = document.getElementById('managerEffectivenessTable');
   if (!tbody) return;
   tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">Manager metrics are available to managers and admins</td></tr>';
 }
 
+function orgSeriesFromQoqTrend(qoqTrend) {
+  const quarters = {};
+  (qoqTrend || []).forEach((t) => { if (t._id) quarters[t._id] = Math.round(t.avgScore || 0); });
+  return [{ label: 'Organization', quarters }];
+}
+
+function renderQoqBarHtml(quarter, avg) {
+  const display = avg != null && avg > 0 ? `${avg}%` : 'TBD';
+  const cls = avg >= 70 ? 'high' : avg >= 40 ? 'medium' : 'low';
+  const width = avg != null ? Math.min(avg, 100) : 0;
+  return `<div style="display:flex;align-items:center;gap:12px">
+    <span style="min-width:24px;font-size:12px;color:var(--text-muted)">${quarter}</span>
+    <div class="progress-bar" style="flex:1"><div class="progress-fill ${cls}" style="width:${width}%"></div></div>
+    <span style="font-weight:700;min-width:40px;font-size:13px">${display}</span>
+  </div>`;
+}
+
+function renderQoqSeriesHtml(series, { subtitleKey } = {}) {
+  if (!series?.length) {
+    return '<p style="color:var(--text-muted);padding:12px">No data for this view.</p>';
+  }
+  return series.map((row) => {
+    const sub = subtitleKey && row[subtitleKey]
+      ? ` <span style="font-size:11px;color:var(--text-muted)">(${esc(row[subtitleKey])})</span>`
+      : '';
+    const bars = ANALYTICS_QUARTERS.map((q) => renderQoqBarHtml(q, row.quarters?.[q] ?? null)).join('');
+    return `<div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">${esc(row.label)}${sub}</div>
+      ${bars}
+    </div>`;
+  }).join('');
+}
+
+function renderQoqTrendFromData(data) {
+  const container = document.getElementById('qoqTrend');
+  const caption = document.getElementById('qoqTrendCaption');
+  if (!container || !data) return;
+  const level = document.getElementById('qoqLevel')?.value || 'org';
+  let series = [];
+  let captionText = '';
+  if (level === 'org') {
+    series = orgSeriesFromQoqTrend(data.qoqTrend);
+    captionText = 'Organization — average achievement score by quarter';
+  } else if (level === 'department') {
+    series = data.qoqByDepartment || [];
+    captionText = 'Department level — average score by quarter';
+  } else if (level === 'team') {
+    series = data.qoqByTeam || [];
+    captionText = 'Team (manager) level — average score by quarter';
+  } else {
+    series = data.qoqByIndividual || [];
+    captionText = 'Individual level — average score by quarter (top 50)';
+  }
+  container.innerHTML = renderQoqSeriesHtml(series, { subtitleKey: level === 'individual' ? 'department' : null });
+  if (caption) caption.textContent = captionText;
+}
+
 async function renderEmployeeQoqTrend(goals) {
   const container = document.getElementById('qoqTrend');
+  const caption = document.getElementById('qoqTrendCaption');
   if (!container) return;
-  setContainerLoading('qoqTrend');
-  try {
-    const quarters = ['Q1', 'Q2', 'Q3', 'Q4'];
-    const avgs = quarters.map((q) => {
-      const scored = (goals || []).map((g) => getAchForQuarter(g, q).score || 0);
-      if (!scored.length) return { q, avg: 0 };
-      const avg = Math.round(scored.reduce((s, n) => s + n, 0) / scored.length);
-      return { q, avg };
-    });
-    container.innerHTML = avgs.map(({ q, avg }) => `
-    <div style="display:flex;align-items:center;gap:12px">
-      <span style="min-width:24px;font-size:12px;color:var(--text-muted)">${q}</span>
-      <div class="progress-bar" style="flex:1"><div class="progress-fill ${avg >= 70 ? 'high' : avg >= 40 ? 'medium' : 'low'}" style="width:${Math.min(avg, 100)}%"></div></div>
-      <span style="font-weight:700;min-width:40px;font-size:13px">${avg ? avg + '%' : 'TBD'}</span>
-    </div>`).join('');
-  } catch (err) {
-    showToast(err.message, 'danger');
-    container.innerHTML = '<p style="color:var(--text-muted);padding:20px">Unable to load trend</p>';
+  const quarters = {};
+  ANALYTICS_QUARTERS.forEach((q) => {
+    const scored = (goals || []).map((g) => getAchForQuarter(g, q).score || 0).filter((n) => n > 0);
+    quarters[q] = scored.length
+      ? Math.round(scored.reduce((s, n) => s + n, 0) / scored.length)
+      : null;
+  });
+  container.innerHTML = renderQoqSeriesHtml([{ label: 'You (individual)', quarters }]);
+  if (caption) caption.textContent = 'Individual — your average achievement score by quarter';
+}
+
+function renderDeptBreakdown(deptBreakdown) {
+  const tbody = document.getElementById('deptBreakdownTable');
+  if (!tbody) return;
+  if (!deptBreakdown?.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:20px">No department data</td></tr>';
+    return;
   }
+  tbody.innerHTML = deptBreakdown.map((d) => `
+    <tr>
+      <td><strong>${esc(d.department || 'Unassigned')}</strong></td>
+      <td>${d.employeeCount ?? '—'}</td>
+      <td>${d.goalCount ?? '—'}</td>
+      <td>${d.avgScore != null ? Math.round(d.avgScore) + '%' : '—'}</td>
+    </tr>`).join('');
+}
+
+function heatmapColor(pct) {
+  if (pct >= 80) return '#10b981';
+  if (pct >= 60) return '#2563eb';
+  if (pct >= 40) return '#f59e0b';
+  if (pct > 0) return '#f97316';
+  return 'rgba(128,128,128,0.35)';
+}
+
+function renderCompletionHeatmap(heatmapRows) {
+  const container = document.getElementById('completionHeatmap');
+  if (!container) return;
+  if (!heatmapRows?.length) {
+    container.innerHTML = '<p style="color:var(--text-muted);padding:12px">No completion data yet.</p>';
+    return;
+  }
+  const header = `<tr><th>Department</th>${ANALYTICS_QUARTERS.map((q) => `<th>${q}</th>`).join('')}</tr>`;
+  const body = heatmapRows.map((row) => {
+    const cells = ANALYTICS_QUARTERS.map((q) => {
+      const pct = row.quarters?.[q];
+      const display = pct != null ? `${pct}%` : '—';
+      const bg = pct != null ? heatmapColor(pct) : 'transparent';
+      const color = pct != null && pct > 0 ? '#fff' : 'var(--text-muted)';
+      return `<td><span class="heatmap-cell" style="background:${bg};color:${color}">${display}</span></td>`;
+    }).join('');
+    return `<tr><td>${esc(row.department || 'Unassigned')}</td>${cells}</tr>`;
+  }).join('');
+  container.innerHTML = `<table class="completion-heatmap-table"><thead>${header}</thead><tbody>${body}</tbody></table>`;
+}
+
+function isEmployeeAchievementCheckinComplete(teamData, empId) {
+  const rows = teamData.filter((r) => String(r.employeeId) === String(empId));
+  if (!rows.length) return false;
+  return rows.every((r) => {
+    if (r.status && r.status !== 'not-started') return true;
+    return r.actualValue != null && r.actualValue !== '';
+  });
+}
+
+function onQoqLevelChange() {
+  if (lastAnalyticsData) renderQoqTrendFromData(lastAnalyticsData);
+}
+
+async function onAnalyticsFiltersChange() {
+  const sel = document.getElementById('analyticsQuarter');
+  if (sel) currentQuarter = sel.value;
+  await loadAnalytics();
 }
 
 async function loadAnalytics() {
   showPageError('analytics', null);
+  syncAnalyticsQuarterUi();
+  setAnalyticsRoleVisibility();
   setContainerLoading('managerEffectivenessTable', 6);
+  setContainerLoading('deptBreakdownTable', 4);
+  const heatmap = document.getElementById('completionHeatmap');
+  if (heatmap) heatmap.innerHTML = '<p style="color:var(--text-muted);padding:12px">Loading...</p>';
   try {
     if (currentRole === 'employee') {
-      const sheet = await Goals.mySheet();
-      const sheetGoals = sheet.goals || [];
+      const sheetRes = await Goals.mySheet();
+      const sheetGoals = sheetRes.goals || [];
       const distributionGoals = rawGoals.length ? rawGoals : sheetGoals;
       renderGoalDistribution(distributionGoals);
       const uomData = sheetGoals.map((g) => ({ uomType: g.uomType }));
@@ -2696,12 +3086,20 @@ async function loadAnalytics() {
       renderManagerEffectivenessPlaceholder();
     } else {
       await ensureActiveCycle();
-      const { data } = await Achievements.team(teamAchievementsParams());
-      managerTeamData = data || [];
-      renderGoalDistribution(managerTeamData);
+      const cycleId = activeCycle?._id || activeCycle?.id;
+      const [analytics, teamRes] = await Promise.all([
+        Admin.analytics(cycleId, currentQuarter),
+        Achievements.team(teamAchievementsParams()),
+      ]);
+      lastAnalyticsData = analytics;
+      managerTeamData = teamRes.data || [];
+      renderOrgStats(analytics.orgStats);
+      renderGoalDistributionFromThrust(analytics.thrustBreakdown);
       renderUomBreakdown(managerTeamData);
-      await renderQoqTrend();
-      await renderManagerEffectiveness();
+      renderQoqTrendFromData(analytics);
+      renderDeptBreakdown(analytics.deptBreakdown);
+      renderCompletionHeatmap(analytics.completionHeatmap);
+      await renderManagerEffectiveness(managerTeamData);
     }
   } catch (err) {
     showPageError('analytics', err.message);
@@ -2718,6 +3116,22 @@ async function loadAnalytics() {
 }
 
 const DONUT_COLORS = ['#2563eb', '#10b981', '#f59e0b', '#f97316', '#8b5cf6', '#ef4444'];
+
+function renderOrgStats(orgStats) {
+  const grid = document.getElementById('analyticsOrgStats');
+  if (!grid) return;
+  grid.style.display = '';
+  const s = orgStats || {};
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val ?? '—';
+  };
+  set('orgStatTotalGoals', s.totalGoals ?? 0);
+  set('orgStatAvgScore', s.avgScore != null ? Math.round(s.avgScore) : '—');
+  set('orgStatCompleted', s.completed ?? 0);
+  set('orgStatOnTrack', s.onTrack ?? 0);
+  set('orgStatNotStarted', s.notStarted ?? 0);
+}
 
 function renderGoalDistribution(goalList) {
   const card = document.getElementById('goalDistributionCard');
@@ -2764,6 +3178,55 @@ function renderGoalDistribution(goalList) {
     </div>`;
 }
 
+function renderGoalDistributionFromThrust(thrustBreakdown) {
+  const card = document.getElementById('goalDistributionCard');
+  if (!card) return;
+  const entries = (thrustBreakdown || [])
+    .map((t) => ({
+      area: t._id || 'Other',
+      count: t.goalCount || 0,
+      avgScore: t.avgScore != null ? Math.round(t.avgScore) : null,
+    }))
+    .filter((e) => e.count > 0)
+    .sort((a, b) => b.count - a.count);
+
+  if (!entries.length) {
+    card.innerHTML = '<p style="color:var(--text-muted);padding:20px;text-align:center">No goal data available.</p>';
+    return;
+  }
+
+  const total = entries.reduce((s, e) => s + e.count, 0);
+  let startPct = 0;
+  const gradientParts = [];
+  const legendItems = [];
+
+  entries.forEach(({ area, count, avgScore }, i) => {
+    const color = DONUT_COLORS[i % DONUT_COLORS.length];
+    const slicePct = (count / total) * 100;
+    const endPct = i === entries.length - 1 ? 100 : startPct + slicePct;
+    gradientParts.push(`${color} ${startPct}% ${endPct}%`);
+    const labelPct = Math.round((count / total) * 100);
+    const scoreHint = avgScore != null ? ` · avg ${avgScore}` : '';
+    const title = avgScore != null ? `Avg score: ${avgScore}` : '';
+    legendItems.push(
+      `<div class="legend-item" title="${esc(title)}"><div class="legend-dot" style="background:${color}"></div> ${esc(area)} (${labelPct}%${esc(scoreHint)})</div>`,
+    );
+    startPct = endPct;
+  });
+
+  card.innerHTML = `
+    <div class="donut-wrap">
+      <div class="donut" style="background:conic-gradient(${gradientParts.join(', ')});border-radius:50%">
+        <div style="width:70px;height:70px;background:var(--surface);border-radius:50%;position:absolute"></div>
+        <div class="donut-center">
+          <div class="val">${total}</div>
+          <div class="lbl">Goals</div>
+        </div>
+      </div>
+      <div class="donut-legend">${legendItems.join('')}</div>
+    </div>`;
+}
+
 function renderUomBreakdown(data) {
   const container = document.getElementById('uomBreakdown');
   if (!container) return;
@@ -2779,31 +3242,7 @@ function renderUomBreakdown(data) {
   }).join('') || '<p>No data</p>';
 }
 
-async function renderQoqTrend() {
-  const container = document.getElementById('qoqTrend');
-  if (!container) return;
-  container.innerHTML = '<p style="color:var(--text-muted);padding:12px">Loading...</p>';
-  try {
-    const { qoqTrend } = await Admin.analytics();
-    const quarters = ['Q1', 'Q2', 'Q3', 'Q4'];
-    const map = {};
-    (qoqTrend || []).forEach((t) => { map[t._id] = Math.round(t.avgScore || 0); });
-    container.innerHTML = quarters.map((q) => {
-      const avg = map[q] ?? null;
-      const display = avg !== null ? avg + '%' : 'TBD';
-      const cls = avg >= 70 ? 'high' : avg >= 40 ? 'medium' : 'low';
-      return `<div style="display:flex;align-items:center;gap:12px">
-        <span style="min-width:24px;font-size:12px;color:var(--text-muted)">${q}</span>
-        <div class="progress-bar" style="flex:1"><div class="progress-fill ${cls}" style="width:${Math.min(avg || 0, 100)}%"></div></div>
-        <span style="font-weight:700;min-width:40px;font-size:13px">${display}</span>
-      </div>`;
-    }).join('');
-  } catch (err) {
-    container.innerHTML = '<p style="color:var(--text-muted);padding:20px">Unable to load trend</p>';
-  }
-}
-
-async function renderManagerEffectiveness() {
+async function renderManagerEffectiveness(prefetchedTeamData) {
   const tbody = document.getElementById('managerEffectivenessTable');
   if (!tbody) return;
   setContainerLoading('managerEffectivenessTable', 6);
@@ -2812,13 +3251,13 @@ async function renderManagerEffectiveness() {
   try {
     const [dash, teamRes, escRes, usersRes] = await Promise.all([
       Admin.dashboard(),
-      Achievements.team(teamAchievementsParams()),
+      prefetchedTeamData ? Promise.resolve({ data: prefetchedTeamData }) : Achievements.team(teamAchievementsParams()),
       Admin.escalations(),
       allUsers.length ? Promise.resolve({ users: allUsers }) : Auth.listUsers(),
     ]);
 
     allUsers = usersRes.users || usersRes;
-    const teamData = teamRes.data || [];
+    const teamData = prefetchedTeamData || teamRes.data || [];
     managerTeamData = teamData;
     const stats = dash.managerStats || [];
     const summary = dash.summary || {};
@@ -2836,17 +3275,11 @@ async function renderManagerEffectiveness() {
     const allTeamEmpIds = [...new Set(
       stats.flatMap((m) => (m.teamIds || []).map((id) => String(id))),
     )];
-    const hasCheckinByEmp = {};
-    if (allTeamEmpIds.length) {
-      await loadCheckinsForEmployees(allTeamEmpIds);
-      allTeamEmpIds.forEach((empId) => {
-        hasCheckinByEmp[empId] = (checkinsByEmpId[String(empId)] || []).length > 0;
-      });
-    }
+    const checkinDueOrg = currentQuarter && isQuarterWindowOpen(activeCycle, currentQuarter);
     const orgCheckinDenom = allTeamEmpIds.length;
-    const orgCheckinRate = orgCheckinDenom
+    const orgCheckinRate = checkinDueOrg && orgCheckinDenom
       ? Math.round(
-        allTeamEmpIds.filter((id) => hasCheckinByEmp[id]).length / orgCheckinDenom * 100,
+        allTeamEmpIds.filter((id) => isEmployeeAchievementCheckinComplete(teamData, id)).length / orgCheckinDenom * 100,
       )
       : 0;
 
@@ -2872,7 +3305,7 @@ async function renderManagerEffectiveness() {
         (u) => teamIdSet.has(String(u.id || u._id)),
       ).length;
       const teamPending = pendingApproval.filter(
-        (p) => teamIdSet.has(String(p.userId || p.employeeId || '')),
+        (p) => teamIdSet.has(String(p.userId)),
       ).length;
       const teamSubmitted = Math.max(0, teamSize - teamNotSubmitted);
       const teamApproved = Math.max(0, teamSubmitted - teamPending);
@@ -2884,11 +3317,18 @@ async function renderManagerEffectiveness() {
         ? `<span style="color:var(--success);font-weight:700">${approvalRate}%</span>`
         : `<span style="color:var(--success);font-weight:700">${orgApprovalRate}%</span>${orgNote}`;
 
-      const withCheckin = empIds.filter((id) => hasCheckinByEmp[id]).length;
-      let checkinRate = empIds.length ? Math.round((withCheckin / empIds.length) * 100) : null;
+      const checkinDue = currentQuarter && isQuarterWindowOpen(activeCycle, currentQuarter);
+      const withCheckin = checkinDue
+        ? empIds.filter((id) => isEmployeeAchievementCheckinComplete(teamData, id)).length
+        : 0;
+      let checkinRate = checkinDue && empIds.length
+        ? Math.round((withCheckin / empIds.length) * 100)
+        : null;
       let checkinHtml = checkinRate != null
         ? `${checkinRate}%`
-        : `${orgCheckinRate}%${orgNote}`;
+        : checkinDue
+          ? `${orgCheckinRate}%${orgNote}`
+          : '<span style="color:var(--text-muted)">—</span>';
 
       const teamRows = teamData.filter((r) => teamIdSet.has(String(r.employeeId)));
       const teamAvgScore = teamRows.length
@@ -3194,6 +3634,12 @@ window.submitUnlockRequest = submitUnlockRequest;
 window.loadMyUnlockRequests = loadMyUnlockRequests;
 window.loadAdminUnlockRequests = loadAdminUnlockRequests;
 window.handleUnlockRequest = handleUnlockRequest;
+window.onQoqLevelChange = onQoqLevelChange;
+window.onAnalyticsFiltersChange = onAnalyticsFiltersChange;
+window.openLaunchCheckinModal = openLaunchCheckinModal;
+window.onLaunchPhaseChange = onLaunchPhaseChange;
+window.submitLaunchCheckin = submitLaunchCheckin;
+window.closeCheckinPeriod = closeCheckinPeriod;
 window.handleNotifBellClick = handleNotifBellClick;
 
 initApp();

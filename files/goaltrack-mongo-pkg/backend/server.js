@@ -34,7 +34,7 @@ app.use(express.static(path.join(__dirname, '..')));
 const authRoutes        = require('./routes/auth');
 const goalRoutes        = require('./routes/goals');
 const achievementRoutes = require('./routes/achievements');
-const checkinRoutes     = require('./routes/checkins');
+const checkinRoutes       = require('./routes/checkins');
 const { router: adminRoutes, runEscalationScan } = require('./routes/admin');
 
 app.use('/api/auth',         authRoutes);

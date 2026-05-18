@@ -5,6 +5,8 @@ const User     = require('../models/User');
 const { Goal, GoalSheet } = require('../models/Goal');
 const AuditLog = require('../models/AuditLog');
 const { Escalation } = require('../models/AuditLog');
+const { CheckInPeriod, CheckInAssignment } = require('../models/CheckInPeriod');
+const { refreshAssignmentStatuses } = require('../lib/checkinAssignments');
 const { authenticate, authorize, logAudit } = require('../middleware/auth');
 
 const router = express.Router();
@@ -304,6 +306,50 @@ router.get('/audit-log', authenticate, authorize('admin'), async (req, res) => {
 // ANALYTICS  (MongoDB Aggregation Pipelines)
 // ════════════════════════════════════════════════
 
+const QUARTERS = ['Q1', 'Q2', 'Q3', 'Q4'];
+
+function pivotQoqRows(rawRows, labelKey, idKey = null) {
+  const map = new Map();
+  for (const row of rawRows) {
+    const id = idKey ? String(row._id[idKey] || '') : null;
+    const label = row._id[labelKey] || 'Unassigned';
+    const q = row._id.quarter;
+    if (!q || !QUARTERS.includes(q)) continue;
+    const mapKey = idKey ? `${id}::${label}` : label;
+    if (!map.has(mapKey)) {
+      const entry = { label, quarters: {} };
+      if (id) entry.id = id;
+      if (row._id.department) entry.department = row._id.department;
+      map.set(mapKey, entry);
+    }
+    map.get(mapKey).quarters[q] = Math.round(row.avgScore || 0);
+  }
+  return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function pivotCompletionHeatmap(rawRows) {
+  const map = new Map();
+  for (const row of rawRows) {
+    const dept = row._id.department || 'Unassigned';
+    const q = row._id.quarter;
+    if (!q || !QUARTERS.includes(q)) continue;
+    if (!map.has(dept)) map.set(dept, { department: dept, quarters: {} });
+    const rate = row.total > 0 ? Math.round((row.completed / row.total) * 100) : 0;
+    map.get(dept).quarters[q] = rate;
+  }
+  return [...map.values()].sort((a, b) => a.department.localeCompare(b.department));
+}
+
+function approvedGoalsWithUserPipeline(cycleObjId, goalSheetCollection, extraMatch = {}) {
+  return [
+    { $lookup: { from: goalSheetCollection, localField: 'sheet', foreignField: '_id', as: 'sheet' } },
+    { $unwind: '$sheet' },
+    { $match: { 'sheet.cycle': cycleObjId, 'sheet.status': 'approved', ...extraMatch } },
+    { $lookup: { from: 'users', localField: 'sheet.user', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+  ];
+}
+
 router.get('/analytics', authenticate, authorize('admin', 'manager'), async (req, res) => {
   try {
     let cycleId = req.query.cycle_id;
@@ -312,6 +358,10 @@ router.get('/analytics', authenticate, authorize('admin', 'manager'), async (req
     const mongoose = require('mongoose');
     const cycleObjId = new mongoose.Types.ObjectId(String(cycleId));
     const goalSheetCollection = GoalSheet.collection.name;
+
+    const managerScope = req.user.role === 'manager'
+      ? { 'user.manager': new mongoose.Types.ObjectId(String(req.user._id)) }
+      : {};
 
     // Org-level stats via aggregation
     const orgStats = await GoalSheet.aggregate([
@@ -346,12 +396,11 @@ router.get('/analytics', authenticate, authorize('admin', 'manager'), async (req
       { $sort: { totalWeightage: -1 } },
     ]);
 
-    // QoQ trend (all quarters)
+    // QoQ trend — organization (scoped for managers: their team only)
     const qoqTrend = await Goal.aggregate([
-      { $lookup: { from: goalSheetCollection, localField: 'sheet', foreignField: '_id', as: 'sheet' } },
-      { $unwind: '$sheet' },
-      { $match: { 'sheet.cycle': cycleObjId, 'sheet.status': 'approved' } },
+      ...approvedGoalsWithUserPipeline(cycleObjId, goalSheetCollection, managerScope),
       { $unwind: '$achievements' },
+      { $match: { 'achievements.quarter': { $in: QUARTERS } } },
       { $group: {
           _id:      '$achievements.quarter',
           avgScore: { $avg: '$achievements.score' },
@@ -360,11 +409,60 @@ router.get('/analytics', authenticate, authorize('admin', 'manager'), async (req
       { $sort: { _id: 1 } },
     ]);
 
-    // Department breakdown
+    const qoqDeptRaw = await Goal.aggregate([
+      ...approvedGoalsWithUserPipeline(cycleObjId, goalSheetCollection, managerScope),
+      { $unwind: '$achievements' },
+      { $match: { 'achievements.quarter': { $in: QUARTERS } } },
+      { $group: {
+          _id: {
+            department: { $ifNull: ['$user.department', 'Unassigned'] },
+            quarter: '$achievements.quarter',
+          },
+          avgScore: { $avg: '$achievements.score' },
+      }},
+    ]);
+
+    const qoqTeamRaw = await Goal.aggregate([
+      ...approvedGoalsWithUserPipeline(cycleObjId, goalSheetCollection, managerScope),
+      { $lookup: { from: 'users', localField: 'user.manager', foreignField: '_id', as: 'manager' } },
+      { $unwind: { path: '$manager', preserveNullAndEmptyArrays: true } },
+      { $unwind: '$achievements' },
+      { $match: { 'achievements.quarter': { $in: QUARTERS } } },
+      { $group: {
+          _id: {
+            managerId: '$manager._id',
+            managerName: { $ifNull: ['$manager.name', 'Unassigned'] },
+            quarter: '$achievements.quarter',
+          },
+          avgScore: { $avg: '$achievements.score' },
+      }},
+    ]);
+
+    const qoqIndividualRaw = await Goal.aggregate([
+      ...approvedGoalsWithUserPipeline(cycleObjId, goalSheetCollection, managerScope),
+      { $unwind: '$achievements' },
+      { $match: { 'achievements.quarter': { $in: QUARTERS } } },
+      { $group: {
+          _id: {
+            employeeId: '$user._id',
+            employeeName: '$user.name',
+            department: { $ifNull: ['$user.department', 'Unassigned'] },
+            quarter: '$achievements.quarter',
+          },
+          avgScore: { $avg: '$achievements.score' },
+      }},
+      { $sort: { '_id.employeeName': 1 } },
+      { $limit: 50 },
+    ]);
+
+    // Department breakdown (selected quarter)
     const deptBreakdown = await GoalSheet.aggregate([
       { $match: { cycle: cycleObjId, status: 'approved' } },
       { $lookup: { from: 'users', localField: 'user', foreignField: '_id', as: 'user' } },
       { $unwind: '$user' },
+      ...(req.user.role === 'manager'
+        ? [{ $match: { 'user.manager': new mongoose.Types.ObjectId(String(req.user._id)) } }]
+        : []),
       { $lookup: { from: 'goals', localField: '_id', foreignField: 'sheet', as: 'goals' } },
       { $unwind: '$goals' },
       { $unwind: { path: '$goals.achievements', preserveNullAndEmptyArrays: true } },
@@ -375,11 +473,55 @@ router.get('/analytics', authenticate, authorize('admin', 'manager'), async (req
           goalCount:     { $sum: 1 },
           avgScore:      { $avg: '$goals.achievements.score' },
       }},
-      { $project: { department: '$_id', employeeCount: { $size: '$employeeCount' }, goalCount: 1, avgScore: 1 } },
+      { $project: {
+          department: { $ifNull: ['$_id', 'Unassigned'] },
+          employeeCount: { $size: '$employeeCount' },
+          goalCount: 1,
+          avgScore: { $round: ['$avgScore', 0] },
+        } },
       { $sort: { avgScore: -1 } },
     ]);
 
-    res.json({ cycleId, quarter, orgStats: orgStats[0] || {}, thrustBreakdown, qoqTrend, deptBreakdown });
+    // Completion heatmap: % of goals with quarterly actuals submitted (by dept × quarter)
+    const completionRaw = await Goal.aggregate([
+      ...approvedGoalsWithUserPipeline(cycleObjId, goalSheetCollection, managerScope),
+      { $unwind: '$achievements' },
+      { $match: { 'achievements.quarter': { $in: QUARTERS } } },
+      { $group: {
+          _id: {
+            department: { $ifNull: ['$user.department', 'Unassigned'] },
+            quarter: '$achievements.quarter',
+          },
+          total: { $sum: 1 },
+          completed: {
+            $sum: {
+              $cond: [{
+                $or: [
+                  { $and: [{ $ne: ['$achievements.status', 'not-started'] }, { $ne: ['$achievements.status', null] }] },
+                  { $and: [{ $ne: ['$achievements.actualValue', null] }, { $ne: ['$achievements.actualValue', ''] }] },
+                ],
+              }, 1, 0],
+            },
+          },
+        }},
+    ]);
+
+    res.json({
+      cycleId,
+      quarter,
+      orgStats: orgStats[0] || {},
+      thrustBreakdown,
+      qoqTrend,
+      qoqByDepartment: pivotQoqRows(qoqDeptRaw, 'department'),
+      qoqByTeam: pivotQoqRows(
+        qoqTeamRaw.filter((r) => r._id.managerId),
+        'managerName',
+        'managerId',
+      ),
+      qoqByIndividual: pivotQoqRows(qoqIndividualRaw, 'employeeName', 'employeeId'),
+      deptBreakdown,
+      completionHeatmap: pivotCompletionHeatmap(completionRaw),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -443,7 +585,7 @@ async function runEscalationScan(cycle) {
   const now       = new Date();
   const closeDate = new Date(cycle.goalCloseDate);
   const daysPast  = Math.floor((now - closeDate) / 86400000);
-  let noSubmit = 0, noApprove = 0;
+  let noSubmit = 0, noApprove = 0, noCheckin = 0;
 
   if (daysPast >= cycle.escalationDays) {
     // Employees who haven't submitted
@@ -478,7 +620,28 @@ async function runEscalationScan(cycle) {
     }
   }
 
-  return { noSubmissionEscalations: noSubmit, noApprovalEscalations: noApprove, daysPastDeadline: daysPast };
+  const periodIds = await CheckInPeriod.find({ cycle: cycle._id }).select('_id');
+  await Promise.all(periodIds.map((p) => refreshAssignmentStatuses(p._id)));
+
+  const overdueAssignments = await CheckInAssignment.find({ status: 'overdue' })
+    .populate({ path: 'period', match: { cycle: cycle._id } });
+
+  for (const a of overdueAssignments) {
+    if (!a.period) continue;
+    const result = await Escalation.findOneAndUpdate(
+      { user: a.employee, cycle: cycle._id, type: 'no_checkin' },
+      { $setOnInsert: { user: a.employee, cycle: cycle._id, type: 'no_checkin' } },
+      { upsert: true, new: false },
+    );
+    if (!result) noCheckin++;
+  }
+
+  return {
+    noSubmissionEscalations: noSubmit,
+    noApprovalEscalations: noApprove,
+    noCheckinEscalations: noCheckin,
+    daysPastDeadline: daysPast,
+  };
 }
 
 module.exports = { router, runEscalationScan };

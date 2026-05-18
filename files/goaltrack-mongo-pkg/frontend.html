@@ -1141,6 +1141,13 @@
     textarea.form-control { resize: vertical; min-height: 80px; }
 
     .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+
+    .completion-heatmap-wrap { overflow-x: auto; }
+    .completion-heatmap-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .completion-heatmap-table th, .completion-heatmap-table td { padding: 8px 10px; text-align: center; border: 1px solid var(--border); }
+    .completion-heatmap-table th:first-child, .completion-heatmap-table td:first-child { text-align: left; font-weight: 600; }
+    .heatmap-cell { border-radius: 4px; font-weight: 700; color: #fff; min-width: 44px; }
+
     .three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
 
     @media (max-width: 900px) {
@@ -1473,6 +1480,13 @@
 
     <!-- ===== PAGE: EMPLOYEE DASHBOARD ===== -->
     <div class="page" id="pg-employee-dashboard">
+      <div class="alert alert-warning" id="employeeCheckinTasksAlert" style="display:none;margin-bottom:16px;flex-direction:column;align-items:flex-start">
+        <div style="display:flex;align-items:center;gap:8px;width:100%">
+          <i class="fa fa-bullhorn"></i>
+          <strong>Check-in tasks assigned to you</strong>
+        </div>
+        <div id="employeeCheckinTasksList" style="width:100%;margin-top:8px"></div>
+      </div>
       <div class="stats-grid">
         <div class="stat-card blue">
           <div class="stat-icon blue"><i class="fa fa-bullseye"></i></div>
@@ -1520,42 +1534,8 @@
             <span class="card-title">📅 Check-in Schedule</span>
           </div>
           <div class="card-body">
-            <div class="checkin-timeline" id="checkinTimeline">
-              <div class="timeline-item">
-                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
-                <div class="timeline-content">
-                  <h4>Phase 1 — Goal Setting</h4>
-                  <p>—</p>
-                </div>
-              </div>
-              <div class="timeline-item">
-                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
-                <div class="timeline-content">
-                  <h4>Q1 Check-in</h4>
-                  <p>—</p>
-                </div>
-              </div>
-              <div class="timeline-item">
-                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
-                <div class="timeline-content">
-                  <h4>Q2 Check-in</h4>
-                  <p>—</p>
-                </div>
-              </div>
-              <div class="timeline-item">
-                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
-                <div class="timeline-content">
-                  <h4>Q3 Check-in</h4>
-                  <p>—</p>
-                </div>
-              </div>
-              <div class="timeline-item">
-                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
-                <div class="timeline-content">
-                  <h4>Q4 / Annual</h4>
-                  <p>—</p>
-                </div>
-              </div>
+                        <div class="checkin-timeline" id="checkinTimeline">
+              <p style="color:var(--text-muted);padding:8px">Loading schedule…</p>
             </div>
           </div>
         </div>
@@ -1563,7 +1543,7 @@
 
       <div class="card">
         <div class="card-header">
-          <span class="card-title" id="employeeAchievementSummaryTitle">📊 Achievement Summary</span>
+          <span class="card-title" id="employeeAchievementSummaryTitle">ummary</span>
           <button class="btn btn-outline btn-sm" onclick="exportReportCSV()"><i class="fa fa-download"></i> Export CSV</button>
         </div>
         <div class="table-wrap">
@@ -1744,6 +1724,20 @@
 
       <div class="card">
         <div class="card-header">
+          <span class="card-title">📅 Check-in Rounds</span>
+          <button class="btn btn-primary btn-sm" onclick="openLaunchCheckinModal()">
+            <i class="fa fa-bullhorn"></i> Launch Check-in
+          </button>
+        </div>
+        <div class="card-body" style="padding:0">
+          <table>
+            <thead><tr><th>Phase</th><th>Launched</th><th>Deadline</th><th>Progress</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="checkinPeriodsTable"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" style="display:none">
+        <div class="card-header">
           <span class="card-title">💬 Check-in Comments</span>
           <button class="btn btn-primary btn-sm" onclick="showModal('checkinModal')">
             <i class="fa fa-plus"></i> Add Comment
@@ -1802,6 +1796,21 @@
         </div>
       </div>
 
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">
+          <span class="card-title">📅 Organization Check-in Rounds</span>
+          <button class="btn btn-primary btn-sm" onclick="openLaunchCheckinModal()">
+            <i class="fa fa-bullhorn"></i> Launch Check-in
+          </button>
+        </div>
+        <div class="card-body" style="padding:0">
+          <table>
+            <thead><tr><th>Phase</th><th>Launched</th><th>Deadline</th><th>Progress</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="adminCheckinPeriodsTable"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="two-col">
         <div class="card">
           <div class="card-header">
@@ -1824,12 +1833,12 @@
             </div>
             <div style="margin-bottom:20px">
               <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-                <span style="font-size:13px;font-weight:600">Q1 Check-in Completion</span>
+                <span style="font-size:13px;font-weight:600" id="checkinCompletionLabel">Check-in Completion</span>
                 <span id="checkinRateLabel" style="font-weight:800;color:var(--danger)">0%</span>
               </div>
               <div class="progress-bar"><div id="checkinRateFill" class="progress-fill low" style="width:0%"></div></div>
             </div>
-            <div style="margin-top:20px">
+            <div style="margin-top:20px" class="table-wrap">
               <table>
                 <thead>
                   <tr><th>Employee</th><th>Department</th><th>Submitted</th><th>Approved</th><th>Check-in</th><th>Status</th></tr>
@@ -1852,7 +1861,7 @@
           <div class="card-body" style="padding:0">
             <table>
               <thead>
-                <tr><th>Employee</th><th>Type</th><th>Status</th><th>Action</th></tr>
+                <tr><th>Employee</th><th>Type</th><th>Manager</th><th>Status</th><th>Action</th></tr>
               </thead>
               <tbody id="escalationsTable"></tbody>
             </table>
@@ -1885,6 +1894,40 @@
 
     <!-- ===== PAGE: ANALYTICS ===== -->
     <div class="page" id="pg-analytics">
+      <div style="display:flex;align-items:center;justify-content:flex-end;margin-bottom:16px;gap:12px;flex-wrap:wrap">
+        <label style="font-size:13px;font-weight:600;color:var(--text-muted)">Analytics quarter:</label>
+        <select class="form-control" id="analyticsQuarter" style="width:auto" onchange="onAnalyticsFiltersChange()">
+          <option value="Q1">Q1</option><option value="Q2">Q2</option>
+          <option value="Q3">Q3</option><option value="Q4">Q4</option>
+        </select>
+      </div>
+      <div class="stats-grid" id="analyticsOrgStats" style="display:none;margin-bottom:20px">
+        <div class="stat-card blue">
+          <div class="stat-icon blue"><i class="fa fa-bullseye"></i></div>
+          <div class="stat-value" id="orgStatTotalGoals">—</div>
+          <div class="stat-label">Total Goals</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-icon green"><i class="fa fa-chart-line"></i></div>
+          <div class="stat-value" id="orgStatAvgScore">—</div>
+          <div class="stat-label">Avg. Score</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-icon green"><i class="fa fa-check-circle"></i></div>
+          <div class="stat-value" id="orgStatCompleted">—</div>
+          <div class="stat-label">Completed</div>
+        </div>
+        <div class="stat-card yellow">
+          <div class="stat-icon yellow"><i class="fa fa-road"></i></div>
+          <div class="stat-value" id="orgStatOnTrack">—</div>
+          <div class="stat-label">On Track</div>
+        </div>
+        <div class="stat-card orange">
+          <div class="stat-icon orange"><i class="fa fa-hourglass-half"></i></div>
+          <div class="stat-value" id="orgStatNotStarted">—</div>
+          <div class="stat-label">Not Started</div>
+        </div>
+      </div>
       <div class="three-col">
         <div class="card">
           <div class="card-header"><span class="card-title">Goal Distribution</span></div>
@@ -1903,17 +1946,50 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-header"><span class="card-title">QoQ Trend</span></div>
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+            <span class="card-title">QoQ Trend</span>
+            <select class="form-control" id="qoqLevel" style="width:auto;min-width:140px" onchange="onQoqLevelChange()">
+              <option value="org">Organization</option>
+              <option value="department">Department</option>
+              <option value="team">Team</option>
+              <option value="individual">Individual</option>
+            </select>
+          </div>
           <div class="card-body">
-            <div id="qoqTrend" style="display:flex;flex-direction:column;gap:10px">
+            <div id="qoqTrend" style="display:flex;flex-direction:column;gap:10px;max-height:320px;overflow-y:auto">
               <p style="color:var(--text-muted);padding:20px">Loading...</p>
             </div>
-            <p style="font-size:12px;color:var(--text-muted);margin-top:16px">Organization-level achievement trend per quarter</p>
+            <p id="qoqTrendCaption" style="font-size:12px;color:var(--text-muted);margin-top:16px">Average achievement score by quarter</p>
           </div>
         </div>
       </div>
 
-      <div class="card">
+      <div class="two-col" style="margin-top:20px">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Department Performance</span></div>
+          <div class="card-body" style="padding:0">
+            <table>
+              <thead>
+                <tr><th>Department</th><th>Employees</th><th>Goals</th><th>Avg. Score</th></tr>
+              </thead>
+              <tbody id="deptBreakdownTable">
+                <tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:20px">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Completion Heatmap</span></div>
+          <div class="card-body">
+            <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px">% of goals with quarterly actuals submitted (by department)</p>
+            <div id="completionHeatmap" class="completion-heatmap-wrap">
+              <p style="color:var(--text-muted);padding:12px">Loading...</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+            <div class="card">
         <div class="card-header">
           <span class="card-title">Manager Effectiveness Dashboard</span>
         </div>
@@ -2277,6 +2353,37 @@
     <div class="modal-footer">
       <button class="btn btn-outline" onclick="closeModal('checkinModal')">Cancel</button>
       <button class="btn btn-primary" onclick="saveCheckin()"><i class="fa fa-save"></i> Save Comment</button>
+    </div>
+  </div>
+</div>
+
+<!-- Launch Check-in Round Modal -->
+<div class="modal-overlay" id="launchCheckinModal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">📅 Launch Check-in Round</span>
+      <div class="modal-close" onclick="closeModal('launchCheckinModal')"><i class="fa fa-times"></i></div>
+    </div>
+    <div class="modal-body">
+      <div id="launchCheckinError" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.15);color:#ef4444;font-size:13px"></div>
+      <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px">
+        Opens the check-in for your team (manager) or all employees (admin). Each person gets a notification and must complete by the deadline.
+      </p>
+      <div class="form-group">
+        <label>Check-in phase</label>
+        <select class="form-control" id="launchCheckinPhase" onchange="onLaunchPhaseChange()">
+          <option value="">Loading phases…</option>
+        </select>
+        <p id="launchPhaseHint" style="font-size:12px;color:var(--text-muted);margin-top:6px"></p>
+      </div>
+      <div class="form-group">
+        <label>Deadline for employees</label>
+        <input class="form-control" id="launchCheckinDeadline" type="date" />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal('launchCheckinModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="submitLaunchCheckin()"><i class="fa fa-bullhorn"></i> Launch & Notify</button>
     </div>
   </div>
 </div>

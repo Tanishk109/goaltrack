@@ -30,14 +30,15 @@ async function runSeed({ closeConnection = true } = {}) {
 
   console.log('✅ Users created (password: password123 for all)');
 
+  const now = new Date();
   const cycle = await Cycle.create({
     name:           'FY 2025-26',
-    goalOpenDate:   new Date(Date.now() - 10 * 86400000),
-    goalCloseDate:  new Date(Date.now() + 30 * 86400000),
-    q1Open:         new Date(Date.now() - 5 * 86400000),
-    q2Open:         new Date(Date.now() + 60 * 86400000),
-    q3Open:         new Date(Date.now() + 150 * 86400000),
-    q4Open:         new Date(Date.now() + 240 * 86400000),
+    goalOpenDate:   new Date(now.getTime() - 5 * 86400000),
+    goalCloseDate:  new Date(now.getTime() + 25 * 86400000),
+    q1Open:         new Date(now.getTime() - 2 * 86400000),
+    q2Open:         new Date(now.getTime() + 60 * 86400000),
+    q3Open:         new Date(now.getTime() + 120 * 86400000),
+    q4Open:         new Date(now.getTime() + 180 * 86400000),
     status:         'active',
     escalationDays: 5,
     createdBy:      admin._id,

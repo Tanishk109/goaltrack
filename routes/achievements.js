@@ -4,6 +4,11 @@ const { Goal, GoalSheet } = require('../models/Goal');
 const { CheckIn } = require('../models/AuditLog');
 const { authenticate, authorize } = require('../middleware/auth');
 const { computeScore } = require('../middleware/scoring');
+const { CheckInPeriod } = require('../models/CheckInPeriod');
+const {
+  refreshAssignmentStatuses,
+  validateAchievementCheckinAccess,
+} = require('../lib/checkinAssignments');
 
 const router = express.Router();
 
@@ -23,13 +28,15 @@ router.post('/', authenticate, authorize('employee'), async (req, res) => {
 
     const sheet = await GoalSheet.findById(goal.sheet._id).populate('cycle');
     const cycle = sheet?.cycle;
-    if (cycle) {
-      const now = new Date();
-      const windowMap = { Q1: cycle.q1Open, Q2: cycle.q2Open, Q3: cycle.q3Open, Q4: cycle.q4Open };
-      const windowOpen = windowMap[quarter];
-      if (windowOpen && now < new Date(windowOpen)) {
-        return res.status(400).json({ error: `${quarter} check-in window is not open yet. Opens: ${windowOpen}` });
-      }
+
+    const access = await validateAchievementCheckinAccess(
+      req.user._id,
+      cycle,
+      quarter,
+      sheet?.status,
+    );
+    if (!access.ok) {
+      return res.status(access.mode === 'campaign' ? 403 : 400).json({ error: access.error });
     }
 
     const score = computeScore(goal.uomType, goal.targetValue, actualValue);
@@ -45,6 +52,13 @@ router.post('/', authenticate, authorize('employee'), async (req, res) => {
     }
 
     await goal.save();
+
+    if (sheet?.status === 'approved' && cycle) {
+      const period = await CheckInPeriod.findOne({ cycle: cycle._id, phase: quarter, status: 'active' });
+      if (period) {
+        await refreshAssignmentStatuses(period._id);
+      }
+    }
 
     // If this is a shared goal, sync achievement to all siblings (same sharedFrom source)
     if (goal.isShared && goal.sharedFrom) {

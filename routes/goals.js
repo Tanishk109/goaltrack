@@ -3,6 +3,7 @@ const express = require('express');
 const { Goal, GoalSheet } = require('../models/Goal');
 const Cycle    = require('../models/Cycle');
 const { authenticate, authorize, logAudit } = require('../middleware/auth');
+const AuditLog = require('../models/AuditLog');
 const { UnlockRequest } = require('../models/AuditLog');
 
 const router = express.Router();
@@ -17,6 +18,34 @@ async function getOrCreateSheet(userId, cycleId) {
 }
 
 // ─── Helper: total weightage for a sheet ────────────────────────────────────
+function sheetUserId(sheet) {
+  const u = sheet?.user;
+  if (!u) return '';
+  return String(u._id || u);
+}
+
+async function wasGoalExplicitlyUnlocked(goalId) {
+  const gid = goalId._id || goalId;
+  const [auditHit, approvedReq] = await Promise.all([
+    AuditLog.findOne({ action: 'GOAL_UNLOCKED', entityType: 'goal', entityId: gid }).select('_id'),
+    UnlockRequest.findOne({ goal: gid, status: 'approved' }).select('_id'),
+  ]);
+  return !!(auditHit || approvedReq);
+}
+
+async function ensureApprovedGoalLockState(goal, sheet) {
+  if (!goal || sheet?.status !== 'approved' || goal.locked !== false) return goal;
+  if (await wasGoalExplicitlyUnlocked(goal._id)) return goal;
+  await Goal.findByIdAndUpdate(goal._id, { $set: { locked: true } });
+  goal.locked = true;
+  return goal;
+}
+
+async function ensureApprovedSheetGoalLocks(sheet, goals) {
+  if (sheet?.status !== 'approved' || !goals?.length) return goals;
+  return Promise.all(goals.map((g) => ensureApprovedGoalLockState(g, sheet)));
+}
+
 function isGoalLocked(goal) {
   const sheet = goal.sheet;
   if (sheet?.status === 'approved') return goal.locked !== false;
@@ -45,7 +74,8 @@ router.get('/my-sheet', authenticate, async (req, res) => {
 
     const sheet = await getOrCreateSheet(req.user._id, cycleId);
 
-    const goals = await Goal.find({ sheet: sheet._id }).sort({ createdAt: 1 });
+    let goals = await Goal.find({ sheet: sheet._id }).sort({ createdAt: 1 });
+    goals = await ensureApprovedSheetGoalLocks(sheet, goals);
     const totalWeightage = await getTotalWeightage(sheet._id);
 
     res.json({ sheet, goals, totalWeightage });
@@ -68,7 +98,8 @@ router.get('/sheet/:sheet_id', authenticate, authorize('manager', 'admin'), asyn
       }
     }
 
-    const goals = await Goal.find({ sheet: sheet._id }).sort({ createdAt: 1 });
+    let goals = await Goal.find({ sheet: sheet._id }).sort({ createdAt: 1 });
+    goals = await ensureApprovedSheetGoalLocks(sheet, goals);
     const totalWeightage = await getTotalWeightage(sheet._id);
     res.json({ sheet, goals, totalWeightage });
   } catch (err) {
@@ -125,10 +156,11 @@ router.patch('/:id', authenticate, async (req, res) => {
     }
 
     if (req.user.role === 'employee') {
-      if (String(goal.sheet.user) !== String(req.user._id))
+      if (sheetUserId(goal.sheet) !== String(req.user._id))
         return res.status(403).json({ error: 'Not your goal.' });
       if (goal.sheet.status === 'submitted')
         return res.status(403).json({ error: 'Sheet is submitted for approval.' });
+      await ensureApprovedGoalLockState(goal, goal.sheet);
       if (isGoalLocked(goal))
         return res.status(403).json({ error: 'Goal is locked. Request an unlock from Admin/HR.' });
     }
@@ -366,13 +398,14 @@ router.post('/unlock-request/:goal_id', authenticate, authorize('employee'), asy
     const goal = await Goal.findById(req.params.goal_id).populate('sheet');
     if (!goal) return res.status(404).json({ error: 'Goal not found.' });
 
-    if (String(goal.sheet.user) !== String(req.user._id)) {
+    if (sheetUserId(goal.sheet) !== String(req.user._id)) {
       return res.status(403).json({ error: 'Not your goal.' });
     }
 
     if (goal.sheet?.status !== 'approved') {
       return res.status(400).json({ error: 'Unlock requests apply only to approved goal sheets.' });
     }
+    await ensureApprovedGoalLockState(goal, goal.sheet);
     if (!isGoalLocked(goal)) {
       return res.status(400).json({ error: 'This goal is not locked.' });
     }
