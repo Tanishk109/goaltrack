@@ -135,8 +135,10 @@ router.get('/dashboard', authenticate, authorize('admin', 'manager'), async (req
       const goals = await Goal.find({ sheet: s._id });
       const total = goals.reduce((acc, g) => acc + g.weightage, 0);
       const user = sheetUser(s);
+      const userId = user._id || s.user?._id || s.user;
       return {
         sheetId:        s._id,
+        userId,
         employeeName:   user.name,
         email:          user.email,
         department:     user.department,
@@ -151,8 +153,10 @@ router.get('/dashboard', authenticate, authorize('admin', 'manager'), async (req
       const goals = await Goal.find({ sheet: s._id });
       const total = goals.reduce((acc, g) => acc + g.weightage, 0);
       const user = sheetUser(s);
+      const userId = user._id || s.user?._id || s.user;
       return {
         sheetId:        s._id,
+        userId,
         employeeName:   user.name,
         email:          user.email,
         department:     user.department,

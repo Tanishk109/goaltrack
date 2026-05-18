@@ -18,6 +18,9 @@ let allUsers = [];
 let managerTeamData = [];
 let checkinsByEmpId = {};
 let viewSheetContext = { sheetId: null, employeeName: '' };
+let pendingMySheetLoad = null;
+let adminUnlockRequestsShowAll = false;
+let appNotifications = [];
 
 async function loadCheckinsForEmployees(empIds, { force = false } = {}) {
   const ids = [...new Set(empIds.map((id) => String(id)).filter(Boolean))];
@@ -78,6 +81,7 @@ const navConfig = {
     ]},
     { section: 'Administration', items: [
       { icon: 'fa-users', label: 'Employee Goals', page: 'admin-employee-goals' },
+      { icon: 'fa-unlock-alt', label: 'Unlock Requests', page: 'admin-unlock-requests' },
       { icon: 'fa-cog', label: 'Cycle Config', page: 'cycle-config' },
     ]},
   ],
@@ -106,6 +110,504 @@ function uomLabel(uom) {
 function fmtDate(d) {
   if (!d) return '—';
   return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function fmtMonthYear(d) {
+  if (!d) return '—';
+  return new Date(d).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+}
+
+function cycleQuarterOpen(cycle, quarter) {
+  const key = { Q1: 'q1Open', Q2: 'q2Open', Q3: 'q3Open', Q4: 'q4Open' }[quarter];
+  return cycle?.[key] ? new Date(cycle[key]) : null;
+}
+
+function inferCurrentQuarter(cycle) {
+  if (!cycle) return 'Q1';
+  const now = Date.now();
+  for (const q of ['Q4', 'Q3', 'Q2', 'Q1']) {
+    const open = cycleQuarterOpen(cycle, q);
+    if (open && now >= open.getTime()) return q;
+  }
+  return 'Q1';
+}
+
+function isQuarterWindowOpen(cycle, quarter) {
+  const open = cycleQuarterOpen(cycle, quarter);
+  return !!(open && Date.now() >= open.getTime());
+}
+
+function getPreviousQuarter(q) {
+  return { Q1: 'Q4', Q2: 'Q1', Q3: 'Q2', Q4: 'Q3' }[q] || 'Q4';
+}
+
+function isGoalSettingPhase(cycle, sheet) {
+  if (!cycle?.goalOpenDate || !cycle?.goalCloseDate) return false;
+  const now = Date.now();
+  const open = new Date(cycle.goalOpenDate).getTime();
+  const close = new Date(cycle.goalCloseDate).getTime();
+  return now >= open && now <= close && sheet?.status !== 'approved';
+}
+
+async function ensureActiveCycle() {
+  if (activeCycle) return activeCycle;
+  try {
+    const { cycle } = await Admin.activeCycle();
+    activeCycle = cycle;
+    currentQuarter = inferCurrentQuarter(cycle);
+  } catch {
+    activeCycle = null;
+  }
+  return activeCycle;
+}
+
+/** Query params for Achievements.team — always scoped to active cycle when available. */
+function teamAchievementsParams(overrides = {}) {
+  const params = { quarter: currentQuarter, ...overrides };
+  const cycleId = activeCycle?._id || activeCycle?.id;
+  if (cycleId) params.cycle_id = cycleId;
+  return params;
+}
+
+let adminEmployeeSheetsClickBound = false;
+
+function avgAchievementPercentForQuarter(goalsRaw, quarter, sheetStatus) {
+  if (!goalsRaw.length) return null;
+  const mapped = goalsRaw.map((g) => mapGoalFromApi(g, sheetStatus || currentSheet?.status || 'draft', quarter));
+  const scored = mapped.filter((g) => g.achievement !== '—');
+  if (!scored.length) return null;
+  return Math.round(scored.reduce((s, g) => s + getScore(g), 0) / scored.length);
+}
+
+function countGoalsNewThisCycle(goalsRaw, cycle) {
+  if (!cycle?.goalOpenDate) return 0;
+  const start = new Date(cycle.goalOpenDate).getTime();
+  return goalsRaw.filter((g) => g.createdAt && new Date(g.createdAt).getTime() >= start).length;
+}
+
+function countPendingCheckins(cycle, sheetStatus, goalsRaw) {
+  if (sheetStatus !== 'approved' || !goalsRaw.length) return 0;
+  const q = inferCurrentQuarter(cycle);
+  if (!isQuarterWindowOpen(cycle, q)) return 0;
+  return goalsRaw.filter((g) => {
+    const ach = (g.achievements || []).find((a) => a.quarter === q);
+    if (!ach) return true;
+    if (ach.status === 'not-started') return true;
+    return ach.actualValue == null || ach.actualValue === '';
+  }).length;
+}
+
+function setStatChange(el, text, direction) {
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'stat-change' + (direction ? ` ${direction}` : '');
+}
+
+function updateTopbarCycle() {
+  const el = document.getElementById('topbarCycle');
+  if (!el) return;
+  if (!activeCycle) {
+    el.textContent = 'No active cycle';
+    return;
+  }
+  if (isGoalSettingPhase(activeCycle, currentSheet)) {
+    el.textContent = `${activeCycle.name} · Goal setting`;
+    return;
+  }
+  const open = cycleQuarterOpen(activeCycle, currentQuarter);
+  el.textContent = open
+    ? `${currentQuarter} Check-in · ${fmtMonthYear(open)}`
+    : activeCycle.name;
+}
+
+function updateAchievementSummaryTitle() {
+  const el = document.getElementById('employeeAchievementSummaryTitle');
+  if (el) el.textContent = `📊 ${currentQuarter} Achievement Summary`;
+}
+
+function timelinePhaseState(startDate, endDate, { forceDone = false } = {}) {
+  if (forceDone) return 'done';
+  const now = Date.now();
+  const start = startDate ? new Date(startDate).getTime() : null;
+  const end = endDate ? new Date(endDate).getTime() : null;
+  if (!start) return 'upcoming';
+  if (now < start) return 'upcoming';
+  if (end && now >= end) return 'done';
+  return 'current';
+}
+
+function renderCycleTimeline(cycle) {
+  if (cycle) {
+    activeCycle = cycle;
+    currentQuarter = inferCurrentQuarter(cycle);
+  }
+
+  const chip = document.getElementById('topbarCycle');
+  if (chip && cycle) {
+    const now = new Date();
+    const windows = [
+      { q: 'Q1', open: cycle.q1Open },
+      { q: 'Q2', open: cycle.q2Open },
+      { q: 'Q3', open: cycle.q3Open },
+      { q: 'Q4', open: cycle.q4Open },
+    ];
+    const active = windows.filter((w) => w.open && new Date(w.open) <= now).pop();
+    chip.textContent = active
+      ? `${active.q} Check-in — ${new Date(active.open).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}`
+      : cycle.name;
+  }
+
+  const summaryTitle = document.getElementById('employeeAchievementSummaryTitle')
+    || document.querySelector('#pg-employee-dashboard .card-title');
+  if (summaryTitle && summaryTitle.textContent.includes('Achievement Summary')) {
+    summaryTitle.textContent = `📊 ${currentQuarter} Achievement Summary`;
+  }
+
+  const items = document.querySelectorAll('#checkinTimeline .timeline-item');
+  if (!items.length || !cycle) return;
+
+  const now = new Date();
+  const phases = [
+    { label: 'Phase 1 — Goal Setting', date: cycle.goalOpenDate, closeDate: cycle.goalCloseDate },
+    { label: 'Q1 Check-in', date: cycle.q1Open },
+    { label: 'Q2 Check-in', date: cycle.q2Open },
+    { label: 'Q3 Check-in', date: cycle.q3Open },
+    { label: 'Q4 / Annual', date: cycle.q4Open },
+  ];
+
+  items.forEach((item, i) => {
+    const phase = phases[i];
+    if (!phase) return;
+    const dot = item.querySelector('.timeline-dot');
+    const h4 = item.querySelector('h4');
+    const pEl = item.querySelector('p');
+    if (h4) h4.textContent = phase.label;
+    const d = phase.date ? new Date(phase.date) : null;
+    const nextDate = phases[i + 1]?.date;
+    const isCurrent = d && d <= now && (!nextDate || new Date(nextDate) > now);
+    const isDone = d && (
+      phase.closeDate
+        ? new Date(phase.closeDate) < now
+        : now > d && nextDate && new Date(nextDate) <= now
+    );
+    if (dot) dot.className = `timeline-dot ${isDone ? 'done' : isCurrent ? 'current' : 'upcoming'}`;
+    if (pEl) {
+      pEl.innerHTML = d
+        ? `${d.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}${isCurrent ? ' · <strong style="color:var(--accent)">Active Now</strong>' : ''}`
+        : 'Date not set';
+    }
+  });
+}
+
+function getNotifReadIds() {
+  try {
+    return JSON.parse(localStorage.getItem('gt_notif_read') || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function markNotificationsRead(ids) {
+  const all = new Set([...getNotifReadIds(), ...ids]);
+  localStorage.setItem('gt_notif_read', JSON.stringify([...all]));
+  renderNotificationUI();
+}
+
+function renderNotificationUI() {
+  const list = document.getElementById('notifList');
+  const dot = document.getElementById('notifDot');
+  if (!list) return;
+
+  const readIds = new Set(getNotifReadIds());
+  const unread = appNotifications.filter((n) => !readIds.has(n.id));
+
+  if (dot) dot.classList.toggle('visible', unread.length > 0);
+
+  if (!appNotifications.length) {
+    list.innerHTML = '<div class="notif-empty">No notifications</div>';
+    return;
+  }
+
+  list.innerHTML = appNotifications.map((n) => {
+    const isUnread = !readIds.has(n.id);
+    return `<div class="notif-item${isUnread ? ' unread' : ''}"
+      data-notif-id="${escAttr(n.id)}"
+      data-notif-page="${escAttr(n.page || '')}"
+      role="button"
+      tabindex="0">
+      <div class="notif-item-title">${esc(n.title)}</div>
+      <div class="notif-item-body">${esc(n.body)}</div>
+      ${n.time ? `<div class="notif-item-time">${fmtDate(n.time)}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.notif-item').forEach((item) => {
+    const go = () => {
+      const id = item.dataset.notifId;
+      const page = item.dataset.notifPage;
+      markNotificationsRead([id]);
+      document.getElementById('notifPanel')?.classList.remove('show');
+      if (page) navigateTo(page);
+    };
+    item.addEventListener('click', go);
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+    });
+  });
+}
+
+async function refreshNotifications() {
+  const user = Auth.getUser();
+  if (!user) return;
+  const items = [];
+
+  if (user.role === 'employee') {
+    if (currentSheet?.status === 'returned' && currentSheet.returnNote) {
+      items.push({
+        id: 'sheet-returned',
+        title: 'Goal sheet returned for rework',
+        body: currentSheet.returnNote,
+        page: 'employee-goals',
+        time: currentSheet.updatedAt,
+      });
+    }
+    const pending = countPendingCheckins(activeCycle, currentSheet?.status, rawGoals);
+    if (pending > 0) {
+      items.push({
+        id: `pending-checkins-${currentQuarter}`,
+        title: `${pending} pending check-in${pending > 1 ? 's' : ''}`,
+        body: `Update your ${currentQuarter} goal achievements.`,
+        page: 'employee-dashboard',
+      });
+    }
+    try {
+      const { requests } = await Goals.myUnlockRequests();
+      requests
+        .filter((r) => r.status !== 'pending')
+        .slice(0, 5)
+        .forEach((r) => {
+          items.push({
+            id: `unlock-${normalizeId(r._id || r.id)}`,
+            title: `Unlock request ${r.status}`,
+            body: r.adminNote || r.reason || 'Reviewed by admin',
+            page: 'employee-goals',
+            time: r.resolvedAt,
+          });
+        });
+    } catch { /* optional */ }
+  }
+
+  if (user.role === 'manager' || user.role === 'admin') {
+    try {
+      const dash = await Admin.dashboard();
+      (dash.pendingApproval || []).forEach((s) => {
+        items.push({
+          id: `approval-${normalizeId(s._id)}`,
+          title: 'Goals awaiting your approval',
+          body: `${s.user?.name || 'Employee'} submitted their goal sheet`,
+          page: user.role === 'manager' ? 'manager-dashboard' : 'admin-employee-goals',
+          time: s.submittedAt,
+        });
+      });
+    } catch { /* optional */ }
+  }
+
+  if (user.role === 'admin') {
+    try {
+      const { requests } = await Goals.unlockRequests(false);
+      requests.forEach((r) => {
+        items.push({
+          id: `unlock-req-${normalizeId(r._id || r.id)}`,
+          title: 'Unlock request pending',
+          body: `${r.employee?.name || 'Employee'}: ${r.goal?.title || 'Goal'}`,
+          page: 'admin-unlock-requests',
+          time: r.createdAt,
+        });
+      });
+    } catch { /* optional */ }
+  }
+
+  appNotifications = items;
+  renderNotificationUI();
+}
+
+function bindNotifications() {
+  const btn = document.getElementById('notifBtn');
+  const panel = document.getElementById('notifPanel');
+  const markRead = document.getElementById('notifMarkRead');
+  if (!btn || !panel) return;
+
+  markRead?.addEventListener('click', () => {
+    markNotificationsRead(appNotifications.map((n) => n.id));
+  });
+}
+
+
+let notifPollingTimer = null;
+
+async function pollNotifications() {
+  const dot = document.getElementById('notifDot');
+  if (currentRole === 'admin') {
+    try {
+      const { requests } = await Goals.unlockRequests(false);
+      const pending = requests.filter((r) => r.status === 'pending').length;
+      if (dot) dot.classList.toggle('visible', pending > 0);
+      const badge = document.getElementById('unlockRequestsBadge');
+      if (badge) {
+        badge.textContent = pending > 0 ? `${pending} Pending` : 'None';
+        badge.className = `chip ${pending > 0 ? 'orange' : 'green'}`;
+      }
+      const alertEl = document.getElementById('pendingUnlockAlert');
+      const countEl = document.getElementById('pendingUnlockCount');
+      if (alertEl && countEl) {
+        countEl.textContent = pending;
+        alertEl.style.display = pending > 0 ? 'flex' : 'none';
+      }
+    } catch (_) { /* optional */ }
+  }
+  if (currentRole === 'employee') {
+    try {
+      const { requests } = await Goals.myUnlockRequests();
+      const hasUpdate = requests.some((r) => r.status !== 'pending');
+      if (dot) dot.classList.toggle('visible', hasUpdate);
+    } catch (_) { /* optional */ }
+  }
+  if (currentRole === 'manager') {
+    try {
+      const dash = await Admin.dashboard();
+      const pending = (dash.pendingApproval || []).length;
+      if (dot) dot.classList.toggle('visible', pending > 0);
+    } catch (_) { /* optional */ }
+  }
+}
+
+function startNotifPolling() {
+  stopNotifPolling();
+  pollNotifications();
+  notifPollingTimer = setInterval(pollNotifications, 60000);
+}
+
+function stopNotifPolling() {
+  if (notifPollingTimer) {
+    clearInterval(notifPollingTimer);
+    notifPollingTimer = null;
+  }
+}
+
+function handleNotifBellClick() {
+  if (currentRole === 'admin') navigateTo('admin-unlock-requests');
+  else if (currentRole === 'employee') {
+    navigateTo('employee-goals').then(() => {
+      document.getElementById('myUnlockRequestsList')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  } else if (currentRole === 'manager') navigateTo('manager-dashboard');
+}
+
+
+// ─── Background polling (keeps active views & notifications fresh) ───────────
+const POLL_INTERVAL_MS = 15000;
+let pollTimerId = null;
+let pollInFlight = false;
+
+function isSessionActive() {
+  return Auth.isLoggedIn() && document.getElementById('app')?.style.display !== 'none';
+}
+
+function isAnyModalOpen() {
+  return !!document.querySelector('.modal-overlay.show');
+}
+
+function shouldPausePolling() {
+  return !isSessionActive() || document.hidden || isAnyModalOpen();
+}
+
+function sheetStatusLabel(status) {
+  return ({
+    approved: 'Approved',
+    returned: 'Returned for rework',
+    submitted: 'Submitted',
+    draft: 'Draft',
+  })[status] || status;
+}
+
+function notifySheetStatusChange(prevStatus) {
+  const next = currentSheet?.status;
+  if (!prevStatus || !next || prevStatus === next) return;
+  showToast(`Goal sheet update: ${sheetStatusLabel(next)}`);
+}
+
+async function refreshEmployeeData({ silent = false } = {}) {
+  const prevStatus = currentSheet?.status;
+  const [data, cycleRes] = await Promise.all([
+    fetchMySheetData(),
+    Admin.activeCycle().catch(() => ({ cycle: null })),
+  ]);
+  if (cycleRes.cycle) activeCycle = cycleRes.cycle;
+  currentQuarter = inferCurrentQuarter(activeCycle);
+  if (silent) notifySheetStatusChange(prevStatus);
+  renderSheetStatusBadge();
+  renderSheetReturnNote();
+  renderCycleTimeline(cycleRes.cycle || activeCycle);
+  renderEmployeeStats();
+  renderGoals();
+  renderAchievements();
+  if (document.getElementById('myUnlockRequestsList')) {
+    await loadMyUnlockRequests({ silent });
+  }
+  return data;
+}
+
+async function pollTick() {
+  if (shouldPausePolling() || pollInFlight) return;
+  pollInFlight = true;
+  try {
+    await refreshNotifications();
+    await pollNotifications();
+    const page = getActivePageId();
+    switch (page) {
+      case 'employee-dashboard':
+        await loadEmployeeDashboard({ silent: true });
+        break;
+      case 'employee-goals':
+        await loadMySheet({ silent: true });
+        break;
+      case 'manager-dashboard':
+        await loadManagerDashboard({ silent: true });
+        break;
+      case 'admin-dashboard':
+        await loadAdminDashboard({ silent: true });
+        break;
+      case 'admin-unlock-requests':
+        await loadAdminUnlockRequests(adminUnlockRequestsShowAll, { silent: true });
+        break;
+      case 'admin-employee-goals':
+        await loadAdminEmployeeGoals({ silent: true });
+        break;
+      default:
+        break;
+    }
+  } catch {
+    /* ignore transient poll errors */
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function onPollVisibilityChange() {
+  if (!document.hidden && isSessionActive()) pollTick();
+}
+
+function startPolling() {
+  stopPolling();
+  pollTimerId = setInterval(() => { pollTick(); }, POLL_INTERVAL_MS);
+  document.addEventListener('visibilitychange', onPollVisibilityChange);
+  setTimeout(() => { pollTick(); }, 3000);
+}
+
+function stopPolling() {
+  if (pollTimerId) clearInterval(pollTimerId);
+  pollTimerId = null;
+  document.removeEventListener('visibilitychange', onPollVisibilityChange);
 }
 
 const LOADING_HTML = '<p style="color:var(--text-muted);padding:20px">Loading...</p>';
@@ -143,9 +645,14 @@ function getAchForQuarter(g, quarter) {
   return (g.achievements || g._raw?.achievements || []).find((a) => a.quarter === quarter) || {};
 }
 
+function isGoalLocked(g, sheetStatus) {
+  if (sheetStatus === 'approved') return g.locked !== false;
+  return !!g.locked;
+}
+
 function mapGoalFromApi(g, sheetStatus, quarter = currentQuarter) {
   const ach = getAchForQuarter(g, quarter);
-  const locked = g.locked || sheetStatus === 'approved';
+  const locked = isGoalLocked(g, sheetStatus);
   let status = 'draft';
   if (sheetStatus === 'approved' || locked) status = 'approved';
   else if (sheetStatus === 'submitted') status = 'pending';
@@ -255,7 +762,10 @@ async function doLogin() {
     document.getElementById('app').style.display = 'block';
     setupUser();
     setupNav();
+    await ensureActiveCycle();
     await navigateTo(currentRole + '-dashboard');
+    startPolling();
+    startNotifPolling();
   } catch (err) {
     showToast(err.message, 'danger');
     if (errEl) {
@@ -265,7 +775,11 @@ async function doLogin() {
   }
 }
 
-function doLogout() { Auth.logout(); }
+function doLogout() {
+  stopPolling();
+  stopNotifPolling();
+  Auth.logout();
+}
 
 const PAGE_LOADERS = {
   'employee-dashboard': loadEmployeeDashboard,
@@ -273,6 +787,7 @@ const PAGE_LOADERS = {
   'manager-dashboard': loadManagerDashboard,
   'admin-dashboard': loadAdminDashboard,
   'admin-employee-goals': loadAdminEmployeeGoals,
+  'admin-unlock-requests': () => loadAdminUnlockRequests(true),
   'cycle-config': loadCycleConfig,
   reports: loadReports,
   analytics: loadAnalytics,
@@ -290,11 +805,14 @@ async function navigateTo(pageId, navEl) {
     'manager-dashboard': 'Manager Dashboard', 'admin-dashboard': 'Admin Dashboard',
     analytics: 'Analytics', reports: 'Reports', 'cycle-config': 'Cycle Configuration',
     'admin-employee-goals': 'Employee Goal Sheets',
+    'admin-unlock-requests': 'Unlock Requests',
   };
   document.getElementById('topbarTitle').textContent = titles[pageId] || pageId;
   showPageError(pageId, null);
   const loader = PAGE_LOADERS[pageId];
   if (loader) await loader();
+  updateTopbarCycle();
+  refreshNotifications().catch(() => {});
 }
 
 // ─── Employee ────────────────────────────────────────────────────────────────
@@ -306,42 +824,117 @@ function applyMySheetResponse({ sheet, goals: serverGoals, totalWeightage: tw })
   goals = serverGoals.map((g) => mapGoalFromApi(g, sheet.status));
 }
 
-async function loadMySheet() {
-  showPageError('employee-goals', null);
-  setContainerLoading('goalsTable', 8);
-  const list = document.getElementById('myGoalsList');
-  if (list) list.innerHTML = LOADING_HTML;
+function setAddGoalButtonsLoading(loading) {
+  document.querySelectorAll('[data-add-goal-btn]').forEach((btn) => {
+    btn.disabled = loading;
+    if (loading) btn.setAttribute('aria-busy', 'true');
+    else btn.removeAttribute('aria-busy');
+  });
+}
+
+async function fetchMySheetData() {
+  if (pendingMySheetLoad) return pendingMySheetLoad;
+  pendingMySheetLoad = Goals.mySheet()
+    .then((data) => {
+      applyMySheetResponse(data);
+      return data;
+    })
+    .finally(() => {
+      pendingMySheetLoad = null;
+    });
+  return pendingMySheetLoad;
+}
+
+async function ensureMySheetLoaded() {
+  if (currentSheet) return currentSheet;
+  await fetchMySheetData();
+  if (!currentSheet) throw new Error('No goal sheet loaded. Please refresh the page.');
+  return currentSheet;
+}
+
+function goalSheetEditBlockedMessage() {
+  if (!currentSheet) return 'No goal sheet loaded. Please refresh the page.';
+  if (currentSheet.status === 'approved') {
+    return 'Your goal sheet is approved and locked. Use "Request Unlock" on a specific goal if changes are needed.';
+  }
+  if (currentSheet.status === 'submitted') {
+    return 'You cannot add goals while the sheet is submitted for approval.';
+  }
+  return 'Goal sheet is not editable in its current status.';
+}
+
+async function openAddGoalModal() {
+  const errEl = document.getElementById('addGoalModalError');
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+
+  setAddGoalButtonsLoading(true);
   try {
-    const data = await Goals.mySheet();
-    applyMySheetResponse(data);
-    renderSheetStatusBadge();
-    renderSheetReturnNote();
-    renderGoals();
+    await ensureMySheetLoaded();
   } catch (err) {
-    showPageError('employee-goals', err.message);
-    showToast(err.message, 'danger');
-    const table = document.getElementById('goalsTable');
-    if (table) table.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);padding:20px">Unable to load goals</td></tr>';
+    showToast(err.message || 'Unable to load goal sheet', 'danger');
+    return;
+  } finally {
+    setAddGoalButtonsLoading(false);
+  }
+
+  if (!canEditGoals()) {
+    const msg = goalSheetEditBlockedMessage();
+    showToast(msg, 'danger');
+    return;
+  }
+  showModal('addGoalModal');
+}
+
+async function loadMySheet({ silent = false } = {}) {
+  if (!silent) {
+    showPageError('employee-goals', null);
+    setContainerLoading('goalsTable', 8);
+    const list = document.getElementById('myGoalsList');
+    if (list) list.innerHTML = LOADING_HTML;
+    setAddGoalButtonsLoading(true);
+  }
+  try {
+    await refreshEmployeeData({ silent });
+    if (!silent) showPageError('employee-goals', null);
+    return { sheet: currentSheet, goals: rawGoals, totalWeightage };
+  } catch (err) {
+    if (!silent) {
+      showPageError('employee-goals', err.message);
+      showToast(err.message, 'danger');
+      const table = document.getElementById('goalsTable');
+      if (table) table.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);padding:20px">Unable to load goals</td></tr>';
+    }
+  } finally {
+    if (!silent) setAddGoalButtonsLoading(false);
   }
 }
 
-async function loadEmployeeDashboard() {
-  showPageError('employee-dashboard', null);
-  setContainerLoading('myGoalsList');
-  setContainerLoading('achievementTable', 7);
+async function loadEmployeeDashboard({ silent = false } = {}) {
+  if (!silent) {
+    showPageError('employee-dashboard', null);
+    setContainerLoading('myGoalsList');
+    setContainerLoading('achievementTable', 7);
+    setAddGoalButtonsLoading(true);
+  }
   try {
-    const data = await Goals.mySheet();
-    applyMySheetResponse(data);
-    renderEmployeeStats();
-    renderGoals();
-    renderAchievements();
+    const data = await refreshEmployeeData({ silent });
+    if (!silent) {
+      showPageError('employee-dashboard', null);
+      refreshNotifications().catch(() => {});
+      pollNotifications();
+    }
+    return data;
   } catch (err) {
-    showPageError('employee-dashboard', err.message);
-    showToast(err.message, 'danger');
-    const list = document.getElementById('myGoalsList');
-    if (list) list.innerHTML = '<p style="color:var(--text-muted);padding:20px">Unable to load goals</p>';
-    const table = document.getElementById('achievementTable');
-    if (table) table.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px">Unable to load achievements</td></tr>';
+    if (!silent) {
+      showPageError('employee-dashboard', err.message);
+      showToast(err.message, 'danger');
+      const list = document.getElementById('myGoalsList');
+      if (list) list.innerHTML = '<p style="color:var(--text-muted);padding:20px">Unable to load goals</p>';
+      const table = document.getElementById('achievementTable');
+      if (table) table.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px">Unable to load achievements</td></tr>';
+    }
+  } finally {
+    if (!silent) setAddGoalButtonsLoading(false);
   }
 }
 
@@ -386,11 +979,11 @@ function renderSheetReturnNote() {
 function renderEmployeeStats() {
   const grid = document.querySelector('#pg-employee-dashboard .stats-grid');
   if (!grid) return;
+  const pendingCheckins = goals.filter((g) => g.locked && g.achievement === '—').length;
   const avg = goals.length ? Math.round(goals.reduce((s, g) => s + getScore(g), 0) / goals.length) : 0;
-  const vals = [goals.length, avg + '%', '—', totalWeightage + '%'];
-  const labels = ['Active Goals', 'Avg. Achievement', 'Pending Check-ins', 'Weightage Used'];
+  const vals = [goals.length, avg + '%', pendingCheckins, totalWeightage + '%'];
   grid.querySelectorAll('.stat-value').forEach((el, i) => { if (vals[i] != null) el.textContent = vals[i]; });
-  grid.querySelectorAll('.stat-label').forEach((el, i) => { if (labels[i]) el.textContent = labels[i]; });
+  grid.querySelectorAll('.stat-change').forEach((el) => { el.textContent = ''; el.className = 'stat-change'; });
 }
 
 function renderGoals() {
@@ -427,6 +1020,15 @@ function renderGoals() {
      currentSheet?.status === 'submitted' ? 'Submitted — waiting for manager approval' :
      currentSheet?.status === 'approved' ? 'Approved and locked' :
      'Waiting for manager approval'}</div>`}
+        ${g.locked && currentRole === 'employee'
+    ? `<span class="chip orange" style="font-size:11px;margin-top:4px;display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px">
+         🔒 Locked
+         <button class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 8px"
+           onclick="openUnlockRequestModal('${g.id}', ${JSON.stringify(g.title)})">
+           Request Unlock
+         </button>
+       </span>`
+    : ''}
       </div>`).join('') : '<div class="empty-state"><i class="fa fa-bullseye"></i><p>No goals yet. Add your first goal!</p></div>';
   }
 
@@ -449,10 +1051,10 @@ function renderGoals() {
         <td><div style="display:flex;gap:6px;flex-wrap:wrap">
           ${canEdit ? `<button class="btn btn-outline btn-sm" onclick="openEditGoal('${g.id}')">Edit</button>` : ''}
           ${canDel ? `<button class="btn btn-danger btn-sm" onclick="deleteGoal('${g.id}')"><i class="fa fa-trash"></i></button>` : ''}
-          ${g.locked && currentRole === 'admin'
-    ? `<button class="btn btn-warning btn-sm" onclick="unlockGoal('${g.id}')"><i class="fa fa-lock-open"></i> Unlock</button>`
-    : g.locked
-    ? `<span class="btn btn-outline btn-sm" style="cursor:default;opacity:0.6" title="Locked — contact admin to unlock"><i class="fa fa-lock"></i> Locked</span>`
+          ${g.locked
+    ? currentRole === 'admin'
+      ? `<button class="btn btn-warning btn-sm" onclick="unlockGoal('${g.id}')"><i class="fa fa-lock-open"></i> Unlock</button>`
+      : `<button class="btn btn-outline btn-sm" onclick="openUnlockRequestModal('${g.id}', ${JSON.stringify(g.title)})"><i class="fa fa-lock"></i> Request Unlock</button>`
     : ''}
         </div></td>
       </tr>`;
@@ -516,9 +1118,18 @@ async function addGoal() {
   const errEl = document.getElementById('addGoalModalError');
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
 
+  try {
+    await ensureMySheetLoaded();
+  } catch (err) {
+    const msg = 'Could not load your goal sheet. Please refresh.';
+    showToast(msg, 'danger');
+    if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+    return;
+  }
+
   if (!canEditGoals()) {
     const msg = currentSheet?.status === 'approved'
-      ? 'Your goal sheet is approved and locked. Ask HR to unlock specific goals if changes are needed.'
+      ? 'Your goal sheet is approved and locked. Use "Request Unlock" on a specific goal if changes are needed.'
       : 'You cannot add goals while the sheet is submitted for approval.';
     showToast(msg, 'danger');
     if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
@@ -576,6 +1187,14 @@ async function addGoal() {
 async function submitGoals() {
   const errEl = document.getElementById('submitGoalsError');
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+
+  try {
+    await ensureMySheetLoaded();
+  } catch (err) {
+    const msg = err.message || 'Unable to load goal sheet';
+    if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+    return;
+  }
 
   if (totalWeightage !== 100) {
     const msg = `Weightage is ${totalWeightage}%. Must be exactly 100%.`;
@@ -741,7 +1360,8 @@ function setManagerQuarter(q) {
 async function loadManagerTeamProgress() {
   setContainerLoading('teamProgressTable', 7);
   try {
-    const teamRes = await Achievements.team({ quarter: currentQuarter });
+    await ensureActiveCycle();
+    const teamRes = await Achievements.team(teamAchievementsParams());
     managerTeamData = teamRes.data || [];
     renderTeamProgress(managerTeamData);
   } catch (err) {
@@ -751,21 +1371,23 @@ async function loadManagerTeamProgress() {
   }
 }
 
-async function loadManagerDashboard() {
-  showPageError('manager-dashboard', null);
+async function loadManagerDashboard({ silent = false } = {}) {
+  if (!silent) {
+    showPageError('manager-dashboard', null);
+    setContainersLoading([
+      { id: 'pendingApprovalTable', cols: 6 },
+      { id: 'teamProgressTable', cols: 7 },
+      { id: 'checkinCommentsTable', cols: 4 },
+    ]);
+  }
   const sel = document.getElementById('managerQuarter');
   if (sel) sel.value = currentQuarter;
   const label = document.getElementById('teamQuarterLabel');
   if (label) label.textContent = currentQuarter;
-  setContainersLoading([
-    { id: 'pendingApprovalTable', cols: 6 },
-    { id: 'teamProgressTable', cols: 7 },
-    { id: 'checkinCommentsTable', cols: 4 },
-  ]);
   try {
     const [dash, teamRes, usersRes] = await Promise.all([
       Admin.dashboard(),
-      Achievements.team({ quarter: currentQuarter }),
+      Achievements.team(teamAchievementsParams()),
       Auth.listUsers(),
     ]);
     allUsers = usersRes.users || usersRes;
@@ -783,15 +1405,18 @@ async function loadManagerDashboard() {
     const allCheckins = flatCheckinsForEmployees(empIds);
     allCheckins.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     renderCheckinComments(allCheckins.slice(0, 10));
+    if (!silent) showPageError('manager-dashboard', null);
   } catch (err) {
-    showPageError('manager-dashboard', err.message);
-    showToast(err.message, 'danger');
-    const pending = document.getElementById('pendingApprovalTable');
-    const team = document.getElementById('teamProgressTable');
-    const checkins = document.getElementById('checkinCommentsTable');
-    if (pending) pending.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
-    if (team) team.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
-    if (checkins) checkins.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+    if (!silent) {
+      showPageError('manager-dashboard', err.message);
+      showToast(err.message, 'danger');
+      const pending = document.getElementById('pendingApprovalTable');
+      const team = document.getElementById('teamProgressTable');
+      const checkins = document.getElementById('checkinCommentsTable');
+      if (pending) pending.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+      if (team) team.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+      if (checkins) checkins.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+    }
   }
 }
 
@@ -967,7 +1592,7 @@ async function viewSheetGoals(sheetId, employeeName) {
         ? `<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px" data-inline-edit="1" data-goal-id="${escAttr(goalId)}" data-weightage="${g.weightage}" data-target="${escAttr(targetEnc)}"><i class="fa fa-pencil"></i> Edit</button>`
         : '';
       const unlockBtn = (currentRole === 'admin' && g.locked)
-        ? `<button type="button" class="btn btn-warning btn-sm" style="margin-top:8px;margin-left:4px" data-unlock-goal="${escAttr(goalId)}"><i class="fa fa-lock-open"></i> Unlock</button>`
+        ? `<button type="button" class="btn btn-warning btn-sm" style="margin-top:8px;margin-left:4px" onclick="unlockGoalAndRefresh('${goalId}')"><i class="fa fa-lock-open"></i> Unlock</button>`
         : '';
       return `
       <div class="view-sheet-goal-row" data-goal-id="${esc(goalId)}" style="padding:10px 0;border-bottom:1px solid var(--border)">
@@ -985,23 +1610,18 @@ async function viewSheetGoals(sheetId, employeeName) {
   }
 }
 
-function bindViewSheetBodyActions() {
-  const body = document.getElementById('viewSheetBody');
-  if (!body || body.dataset.actionsBound) return;
-  body.dataset.actionsBound = '1';
-  body.addEventListener('click', (e) => {
-    const unlockBtn = e.target.closest('[data-unlock-goal]');
-    if (unlockBtn) {
-      unlockGoalAndRefresh(unlockBtn.getAttribute('data-unlock-goal'));
-      return;
-    }
+function bindViewSheetModalActions() {
+  const modal = document.getElementById('viewSheetModal');
+  if (!modal || modal.dataset.actionsBound) return;
+  modal.dataset.actionsBound = '1';
+  modal.addEventListener('click', (e) => {
     const editBtn = e.target.closest('[data-inline-edit]');
-    if (editBtn) {
-      const goalId = editBtn.getAttribute('data-goal-id');
-      const weightage = parseInt(editBtn.getAttribute('data-weightage'), 10);
-      const target = decodeURIComponent(editBtn.getAttribute('data-target') || '');
-      toggleInlineEdit(editBtn, goalId, weightage, target);
-    }
+    if (!editBtn) return;
+    e.preventDefault();
+    const goalId = editBtn.getAttribute('data-goal-id');
+    const weightage = parseInt(editBtn.getAttribute('data-weightage'), 10);
+    const target = decodeURIComponent(editBtn.getAttribute('data-target') || '');
+    toggleInlineEdit(editBtn, goalId, weightage, target);
   });
 }
 
@@ -1132,7 +1752,8 @@ async function updateCheckinGoals() {
   const empId = empSel.value;
   if (!managerTeamData.length) {
     try {
-      const teamRes = await Achievements.team({ quarter: currentQuarter });
+      await ensureActiveCycle();
+      const teamRes = await Achievements.team(teamAchievementsParams());
       managerTeamData = teamRes.data || [];
     } catch (err) {
       showToast(err.message, 'danger');
@@ -1205,13 +1826,15 @@ async function viewEmployeeCheckins(employeeId) {
 }
 
 // ─── Admin ───────────────────────────────────────────────────────────────────
-async function loadAdminDashboard() {
-  showPageError('admin-dashboard', null);
-  setContainersLoading([
-    { id: 'escalationsTable', cols: 4 },
-    { id: 'auditTrailTable', cols: 4 },
-    { id: 'completionTable', cols: 6 },
-  ]);
+async function loadAdminDashboard({ silent = false } = {}) {
+  if (!silent) {
+    showPageError('admin-dashboard', null);
+    setContainersLoading([
+      { id: 'escalationsTable', cols: 4 },
+      { id: 'auditTrailTable', cols: 4 },
+      { id: 'completionTable', cols: 6 },
+    ]);
+  }
   let dash = { summary: {} };
   let escalations = [];
   let teamCheckins = [];
@@ -1219,38 +1842,47 @@ async function loadAdminDashboard() {
     const [dashRes, escRes, teamRes, usersRes] = await Promise.all([
       Admin.dashboard(),
       Admin.escalations({ all: true }),
-      Achievements.team({ quarter: currentQuarter }).catch(() => ({ data: [] })),
+      Achievements.team(teamAchievementsParams()).catch(() => ({ data: [] })),
       allUsers.length ? Promise.resolve({ users: allUsers }) : Auth.listUsers(),
     ]);
     dash = dashRes;
     escalations = escRes.escalations || [];
     teamCheckins = teamRes.data || [];
     allUsers = usersRes.users || usersRes;
+    if (!silent) showPageError('admin-dashboard', null);
   } catch (err) {
-    showPageError('admin-dashboard', err.message);
-    showToast(err.message, 'danger');
-    const esc = document.getElementById('escalationsTable');
-    if (esc) esc.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
-    const completion = document.getElementById('completionTable');
-    if (completion) completion.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+    if (!silent) {
+      showPageError('admin-dashboard', err.message);
+      showToast(err.message, 'danger');
+      const esc = document.getElementById('escalationsTable');
+      if (esc) esc.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+      const completion = document.getElementById('completionTable');
+      if (completion) completion.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+    }
+    return;
   }
   const activeEsc = escalations.filter((e) => !e.resolved).length;
   renderAdminStats(dash, activeEsc, teamCheckins);
   await renderCompletionTable(dash, teamCheckins);
   renderEscalations(escalations);
-  try {
-    const auditRes = await Admin.auditLog({ limit: 50 });
-    renderAuditTrail(auditRes.logs || []);
-  } catch (err) {
-    showToast(err.message, 'danger');
-    renderAuditTrail([]);
-    const audit = document.getElementById('auditTrailTable');
-    if (audit) audit.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load audit trail</td></tr>';
+  if (!silent) {
+    try {
+      const auditRes = await Admin.auditLog({ limit: 50 });
+      renderAuditTrail(auditRes.logs || []);
+    } catch (err) {
+      showToast(err.message, 'danger');
+      renderAuditTrail([]);
+      const audit = document.getElementById('auditTrailTable');
+      if (audit) audit.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">Unable to load audit trail</td></tr>';
+    }
   }
+  try {
+    await loadAdminUnlockRequests(adminUnlockRequestsShowAll, { silent: true });
+  } catch (_) { /* non-critical */ }
 }
 
-async function loadAdminEmployeeGoals() {
-  setContainerLoading('adminEmployeeSheetsTable', 6);
+async function loadAdminEmployeeGoals({ silent = false } = {}) {
+  if (!silent) setContainerLoading('adminEmployeeSheetsTable', 6);
   try {
     const dash = await Admin.dashboard();
     const allSheets = [
@@ -1312,21 +1944,23 @@ async function loadAdminEmployeeGoals() {
         <td>${actions}</td>
       </tr>`;
     }).join('');
-    bindAdminEmployeeSheetsTable();
   } catch (err) {
-    showToast(err.message, 'danger');
-    const tbody = document.getElementById('adminEmployeeSheetsTable');
-    if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+    if (!silent) {
+      showToast(err.message, 'danger');
+      const tbody = document.getElementById('adminEmployeeSheetsTable');
+      if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+    }
   }
 }
 
+/** Delegated clicks on admin employee sheets — bound once on the page container, not tbody. */
 function bindAdminEmployeeSheetsTable() {
-  const tbody = document.getElementById('adminEmployeeSheetsTable');
-  if (!tbody || tbody.dataset.bound) return;
-  tbody.dataset.bound = '1';
-  tbody.addEventListener('click', (e) => {
+  const page = document.getElementById('pg-admin-employee-goals');
+  if (!page || adminEmployeeSheetsClickBound) return;
+  adminEmployeeSheetsClickBound = true;
+  page.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-sheet-action]');
-    if (!btn) return;
+    if (!btn || !page.contains(btn)) return;
     e.preventDefault();
     const action = btn.getAttribute('data-sheet-action');
     const sheetId = normalizeId(btn.getAttribute('data-sheet-id'));
@@ -1360,8 +1994,8 @@ function renderAdminStats(dash, activeEscalations = 0, teamCheckins = []) {
 
   const checkinDoneCount = new Set(
     (teamCheckins || [])
-      .filter((r) => r.actualValue != null && r.actualValue !== '')
-      .map((r) => r.employeeName),
+      .filter((r) => r.actualValue != null && r.actualValue !== '' && r.employeeId)
+      .map((r) => String(r.employeeId)),
   ).size;
   const totalEmp = s.totalEmployees || 1;
   const checkinRate = Math.round((checkinDoneCount / totalEmp) * 100);
@@ -1397,14 +2031,13 @@ async function renderCompletionTable(dash, teamCheckins) {
   }
 
   const notSubmittedIds = new Set((dash.notSubmitted || []).map((u) => String(u.id || u._id)));
-  const normEmail = (e) => (e || '').toLowerCase().trim();
-  const pendingUserEmails = new Set(
-    (dash.pendingApproval || []).map((p) => normEmail(p.email)).filter(Boolean),
+  const approvedUserIds = new Set(
+    (dash.approvedSheets || []).map((p) => String(p.userId || p.employeeId || '')).filter(Boolean),
   );
-  const checkinDoneNames = new Set();
+  const checkinDoneIds = new Set();
   (teamCheckins || []).forEach((row) => {
-    if (row.actualValue != null && row.actualValue !== '') {
-      checkinDoneNames.add(row.employeeName);
+    if (row.actualValue != null && row.actualValue !== '' && row.employeeId) {
+      checkinDoneIds.add(String(row.employeeId));
     }
   });
 
@@ -1415,10 +2048,9 @@ async function renderCompletionTable(dash, teamCheckins) {
   tbody.innerHTML = employees.map((emp) => {
     const id = String(emp._id || emp.id);
     const name = emp.name;
-    const email = normEmail(emp.email);
     const submitted = !notSubmittedIds.has(id);
-    const approved = submitted && email && !pendingUserEmails.has(email);
-    const checkinDone = checkinDoneNames.has(name);
+    const approved = approvedUserIds.has(id);
+    const checkinDone = checkinDoneIds.has(id);
     const doneCount = [submitted, approved, checkinDone].filter(Boolean).length;
 
     let statusChip;
@@ -1608,6 +2240,10 @@ async function saveCycleConfig() {
   try {
     const { cycle } = await Admin.updateCycle(id, payload);
     populateCycleForm(cycle);
+    currentQuarter = inferCurrentQuarter(cycle);
+    updateTopbarCycle();
+    renderCycleTimeline(activeCycle);
+    updateAchievementSummaryTitle();
     showToast('Cycle configuration saved!');
   } catch (err) {
     showToast(err.message, 'danger');
@@ -1836,7 +2472,7 @@ async function loadReports() {
           status: r.achievementStatus || r.status || 'not-started',
         }));
       } catch (reportErr) {
-        const teamRes = await Achievements.team({ quarter });
+        const teamRes = await Achievements.team(teamAchievementsParams({ quarter }));
         reportData = (teamRes.data || []).map((r) => ({
           employeeName: r.employeeName || '—',
           managerName: '—',
@@ -1975,7 +2611,8 @@ async function loadAnalytics() {
       await renderEmployeeQoqTrend(sheetGoals);
       renderManagerEffectivenessPlaceholder();
     } else {
-      const { data } = await Achievements.team({ quarter: currentQuarter });
+      await ensureActiveCycle();
+      const { data } = await Achievements.team(teamAchievementsParams());
       managerTeamData = data || [];
       renderGoalDistribution(managerTeamData);
       renderUomBreakdown(managerTeamData);
@@ -2091,7 +2728,7 @@ async function renderManagerEffectiveness() {
   try {
     const [dash, teamRes, escRes, usersRes] = await Promise.all([
       Admin.dashboard(),
-      Achievements.team({ quarter: currentQuarter }),
+      Achievements.team(teamAchievementsParams()),
       Admin.escalations(),
       allUsers.length ? Promise.resolve({ users: allUsers }) : Auth.listUsers(),
     ]);
@@ -2137,21 +2774,22 @@ async function renderManagerEffectiveness() {
     tbody.innerHTML = stats.map((m) => {
       const mgrId = String(m._id || m.id || '');
       const teamIdSet = new Set((m.teamIds || []).map((id) => String(id)));
-      const teamNames = new Set();
       allUsers.forEach((u) => {
         if (u.role !== 'employee') return;
         const uid = String(u._id || u.id);
         const reportsTo = String(u.manager?._id || u.manager || '');
-        if (teamIdSet.has(uid) || reportsTo === mgrId) teamNames.add(u.name);
+        if (reportsTo === mgrId) teamIdSet.add(uid);
       });
 
       const teamSize = m.teamSize || teamIdSet.size || 0;
       const empIds = [...teamIdSet];
 
       const teamNotSubmitted = notSubmitted.filter(
-        (u) => teamIdSet.has(String(u.id || u._id)) || u.managerName === m.name,
+        (u) => teamIdSet.has(String(u.id || u._id)),
       ).length;
-      const teamPending = pendingApproval.filter((p) => teamNames.has(p.employeeName)).length;
+      const teamPending = pendingApproval.filter(
+        (p) => teamIdSet.has(String(p.userId || p.employeeId || '')),
+      ).length;
       const teamSubmitted = Math.max(0, teamSize - teamNotSubmitted);
       const teamApproved = Math.max(0, teamSubmitted - teamPending);
 
@@ -2168,7 +2806,7 @@ async function renderManagerEffectiveness() {
         ? `${checkinRate}%`
         : `${orgCheckinRate}%${orgNote}`;
 
-      const teamRows = teamData.filter((r) => teamNames.has(r.employeeName));
+      const teamRows = teamData.filter((r) => teamIdSet.has(String(r.employeeId)));
       const teamAvgScore = teamRows.length
         ? Math.round(teamRows.reduce((s, r) => s + (r.score || 0), 0) / teamRows.length)
         : null;
@@ -2196,6 +2834,159 @@ async function renderManagerEffectiveness() {
   } catch (err) {
     showToast(err.message, 'danger');
     tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
+  }
+}
+
+// ─── Unlock request flow ───────────────────────────────────────────────────────
+function openUnlockRequestModal(goalId, goalTitle) {
+  const modal = document.getElementById('unlockRequestModal');
+  if (!modal) return;
+  document.getElementById('unlockRequestGoalId').value = goalId;
+  document.getElementById('unlockRequestGoalTitle').textContent = goalTitle;
+  document.getElementById('unlockRequestReason').value = '';
+  const errEl = document.getElementById('unlockRequestError');
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+  showModal('unlockRequestModal');
+}
+
+async function submitUnlockRequest() {
+  const goalId = document.getElementById('unlockRequestGoalId').value;
+  const reason = document.getElementById('unlockRequestReason').value.trim();
+  const errEl = document.getElementById('unlockRequestError');
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+
+  if (!reason) {
+    if (errEl) { errEl.textContent = 'Please describe why you need this goal unlocked.'; errEl.style.display = 'block'; }
+    return;
+  }
+  try {
+    await Goals.requestUnlock(normalizeId(goalId), reason);
+    closeModal('unlockRequestModal');
+    showToast('Unlock request sent to Admin. You\'ll be notified when reviewed.');
+    await loadMySheet();
+    loadMyUnlockRequests().catch(() => {});
+    refreshNotifications().catch(() => {});
+  } catch (err) {
+    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
+    showToast(err.message, 'danger');
+  }
+}
+
+async function loadMyUnlockRequests({ silent = false } = {}) {
+  const container = document.getElementById('myUnlockRequestsList');
+  if (!container) return;
+  if (!silent) container.innerHTML = '<p style="color:var(--text-muted);padding:8px">Loading...</p>';
+  try {
+    const { requests } = await Goals.myUnlockRequests();
+    if (!requests.length) {
+      container.innerHTML = '<p style="color:var(--text-muted);padding:8px">No unlock requests yet.</p>';
+      return;
+    }
+    const statusIcon = { pending: '⏳', approved: '✅', rejected: '❌' };
+    const statusCss = { pending: 'status-pending', approved: 'status-approved', rejected: 'status-rejected' };
+    container.innerHTML = requests.map((r) => `
+      <div style="padding:10px 0;border-bottom:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+          <div>
+            <strong>${esc(r.goal?.title || 'Goal')}</strong>
+            <span class="chip blue" style="font-size:11px;margin-left:6px">${esc(r.goal?.thrustArea || '')}</span>
+          </div>
+          <span class="status-badge ${statusCss[r.status] || 'status-draft'}">${statusIcon[r.status] || ''} ${r.status}</span>
+        </div>
+        <p style="font-size:13px;color:var(--text-muted);margin:4px 0">Reason: ${esc(r.reason)}</p>
+        ${r.adminNote ? `<p style="font-size:12px;color:var(--text-muted);margin:2px 0">Admin: ${esc(r.adminNote)}</p>` : ''}
+        <p style="font-size:11px;color:var(--text-muted);margin:4px 0">${fmtDate(r.createdAt)}</p>
+      </div>`).join('');
+  } catch (err) {
+    container.innerHTML = `<p style="color:var(--danger);padding:8px">${esc(err.message)}</p>`;
+  }
+}
+
+async function loadAdminUnlockRequests(showAll = false, { silent = false } = {}) {
+  adminUnlockRequestsShowAll = showAll;
+  const tbody = document.getElementById('unlockRequestsTable');
+  const badge = document.getElementById('unlockRequestsBadge');
+  if (!silent && tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Loading...</td></tr>';
+  try {
+    const { requests } = await Goals.unlockRequests(showAll);
+    const pending = requests.filter((r) => r.status === 'pending').length;
+    if (badge) {
+      badge.textContent = pending > 0 ? `${pending} Pending` : 'None';
+      badge.className = `chip ${pending > 0 ? 'orange' : 'green'}`;
+    }
+    const alertEl = document.getElementById('pendingUnlockAlert');
+    const countEl = document.getElementById('pendingUnlockCount');
+    if (alertEl && countEl) {
+      countEl.textContent = pending;
+      alertEl.style.display = pending > 0 ? 'flex' : 'none';
+    }
+    if (!tbody) return;
+    if (!requests.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">No unlock requests</td></tr>';
+      return;
+    }
+    const statusCss = { pending: 'status-pending', approved: 'status-approved', rejected: 'status-rejected' };
+    tbody.innerHTML = requests.map((r) => {
+      const isPending = r.status === 'pending';
+      const actions = isPending
+        ? `<div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-success btn-sm" onclick="handleUnlockRequest('${normalizeId(r._id || r.id)}', 'approve')">
+              <i class="fa fa-check"></i> Approve
+            </button>
+            <button class="btn btn-danger btn-sm" onclick="handleUnlockRequest('${normalizeId(r._id || r.id)}', 'reject')">
+              <i class="fa fa-times"></i> Reject
+            </button>
+           </div>`
+        : `<span style="color:var(--text-muted);font-size:12px">Resolved by ${esc(r.resolvedBy?.name || '—')}</span>`;
+      return `<tr>
+        <td><strong>${esc(r.employee?.name || '—')}</strong><br>
+          <span style="font-size:11px;color:var(--text-muted)">${esc(r.employee?.department || '')}</span></td>
+        <td>${esc(r.goal?.title || '—')}<br>
+          <span style="font-size:11px;color:var(--text-muted)">${esc(r.goal?.thrustArea || '')}</span></td>
+        <td style="max-width:200px;font-size:13px">${esc(r.reason)}</td>
+        <td>${fmtDate(r.createdAt)}</td>
+        <td><span class="status-badge ${statusCss[r.status] || 'status-draft'}">${r.status}</span></td>
+        <td>${actions}</td>
+      </tr>`;
+    }).join('');
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="6" style="color:var(--danger);padding:20px">${esc(err.message)}</td></tr>`;
+  }
+}
+
+async function handleUnlockRequest(requestId, action) {
+  const adminNote = prompt(
+    action === 'approve'
+      ? 'Optional note to employee (e.g. "Approved for target revision"):'
+      : 'Rejection reason (required):',
+  );
+  if (adminNote === null) return;
+  if (action === 'reject' && !adminNote.trim()) {
+    showToast('Please provide a rejection reason.', 'danger');
+    return;
+  }
+  try {
+    if (action === 'approve') {
+      await Goals.approveUnlockRequest(requestId, adminNote || '');
+      showToast('Unlock request approved. Goal is now unlocked.');
+    } else {
+      await Goals.rejectUnlockRequest(requestId, adminNote);
+      showToast('Unlock request rejected.');
+    }
+    await loadAdminUnlockRequests(adminUnlockRequestsShowAll);
+    await loadAdminEmployeeGoals();
+    try {
+      const pendingRes = await Goals.unlockRequests(false);
+      const pending = (pendingRes.requests || []).length;
+      const alertEl = document.getElementById('pendingUnlockAlert');
+      const countEl = document.getElementById('pendingUnlockCount');
+      if (alertEl && countEl) {
+        countEl.textContent = pending;
+        alertEl.style.display = pending > 0 ? 'flex' : 'none';
+      }
+    } catch (_) { /* non-critical */ }
+  } catch (err) {
+    showToast(err.message, 'danger');
   }
 }
 
@@ -2228,7 +3019,8 @@ function initThemes() {
 
 async function initApp() {
   initThemes();
-  bindViewSheetBodyActions();
+  bindNotifications();
+  bindViewSheetModalActions();
   bindAdminEmployeeSheetsTable();
   const checkinEmp = document.getElementById('checkinEmployee');
   if (checkinEmp) checkinEmp.addEventListener('change', updateCheckinGoals);
@@ -2242,7 +3034,10 @@ async function initApp() {
         document.getElementById('app').style.display = 'block';
         setupUser();
         setupNav();
+        await ensureActiveCycle();
         await navigateTo(currentRole + '-dashboard');
+        startPolling();
+        startNotifPolling();
       }
     } catch (err) {
       showToast(err.message, 'danger');
@@ -2257,6 +3052,7 @@ window.loadMySheet = loadMySheet;
 window.doLogout = doLogout;
 window.navigateTo = navigateTo;
 window.addGoal = addGoal;
+window.openAddGoalModal = openAddGoalModal;
 window.submitGoals = submitGoals;
 window.saveAchievement = saveAchievement;
 window.openAchieve = openAchieve;
@@ -2289,5 +3085,11 @@ window.setManagerQuarter = setManagerQuarter;
 window.loadManagerDashboard = loadManagerDashboard;
 window.loadAdminEmployeeGoals = loadAdminEmployeeGoals;
 window.unlockGoalAndRefresh = unlockGoalAndRefresh;
+window.openUnlockRequestModal = openUnlockRequestModal;
+window.submitUnlockRequest = submitUnlockRequest;
+window.loadMyUnlockRequests = loadMyUnlockRequests;
+window.loadAdminUnlockRequests = loadAdminUnlockRequests;
+window.handleUnlockRequest = handleUnlockRequest;
+window.handleNotifBellClick = handleNotifBellClick;
 
 initApp();

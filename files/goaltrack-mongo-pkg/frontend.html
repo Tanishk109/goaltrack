@@ -504,6 +504,61 @@
       background: var(--danger);
       border-radius: 50%;
       border: 2px solid var(--surface);
+      display: none;
+    }
+
+    .notif-dot.visible { display: block; }
+
+    .notif-wrap { position: relative; }
+
+    .notif-panel {
+      display: none;
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      width: min(360px, calc(100vw - 48px));
+      max-height: 400px;
+      overflow-y: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+      z-index: 200;
+    }
+
+    .notif-panel.show { display: block; }
+
+    .notif-panel-header {
+      padding: 12px 16px;
+      font-weight: 700;
+      font-size: 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .notif-item {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .notif-item:hover { background: var(--bg); }
+    .notif-item:last-child { border-bottom: none; }
+
+    .notif-item.unread .notif-item-title { color: var(--primary-light); }
+
+    .notif-item-title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+    .notif-item-body { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
+    .notif-item-time { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+
+    .notif-empty {
+      padding: 24px 16px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 13px;
     }
 
     .page {
@@ -760,6 +815,19 @@
     .modal-close:hover { color: var(--danger); border-color: var(--danger); }
 
     .modal-body { padding: 24px; }
+
+    #viewSheetModal .modal {
+      display: flex;
+      flex-direction: column;
+      max-height: 90vh;
+      overflow: hidden;
+    }
+
+    #viewSheetModal .modal-body {
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+    }
     .modal-footer {
       padding: 18px 24px;
       border-top: 1px solid var(--border);
@@ -1262,11 +1330,22 @@
             <button type="button" class="theme-swatch" data-theme="forest" title="Forest" onclick="setTheme('forest')"></button>
           </div>
         </div>
-        <div class="notif-btn" title="Notifications">
-          <i class="fa fa-bell"></i>
-          <span class="notif-dot"></span>
+        <div class="notif-wrap">
+          <div class="notif-btn" id="notifBtn" title="Notifications" onclick="handleNotifBellClick()">
+            <i class="fa fa-bell"></i>
+            <span class="notif-dot" id="notifDot"></span>
+          </div>
+          <div class="notif-panel" id="notifPanel" role="region" aria-label="Notifications">
+            <div class="notif-panel-header">
+              <span>Notifications</span>
+              <button type="button" class="btn btn-outline btn-sm" id="notifMarkRead">Mark all read</button>
+            </div>
+            <div id="notifList">
+              <div class="notif-empty">No notifications</div>
+            </div>
+          </div>
         </div>
-        <span id="topbarCycle" class="chip orange">Q1 Check-in — July 2025</span>
+        <span id="topbarCycle" class="chip orange">—</span>
       </div>
     </div>
 
@@ -1275,27 +1354,27 @@
       <div class="stats-grid">
         <div class="stat-card blue">
           <div class="stat-icon blue"><i class="fa fa-bullseye"></i></div>
-          <div class="stat-value">5</div>
+          <div class="stat-value">—</div>
           <div class="stat-label">Active Goals</div>
-          <div class="stat-change up">↑ 2 new this cycle</div>
+          <div class="stat-change">—</div>
         </div>
         <div class="stat-card green">
           <div class="stat-icon green"><i class="fa fa-check-circle"></i></div>
-          <div class="stat-value">72%</div>
+          <div class="stat-value">—</div>
           <div class="stat-label">Avg. Achievement</div>
-          <div class="stat-change up">↑ 8% from Q4</div>
+          <div class="stat-change">—</div>
         </div>
         <div class="stat-card orange">
           <div class="stat-icon orange"><i class="fa fa-clock"></i></div>
-          <div class="stat-value">3</div>
+          <div class="stat-value">—</div>
           <div class="stat-label">Pending Check-ins</div>
-          <div class="stat-change down">↓ Due this month</div>
+          <div class="stat-change">—</div>
         </div>
         <div class="stat-card yellow">
           <div class="stat-icon yellow"><i class="fa fa-weight"></i></div>
-          <div class="stat-value">100%</div>
+          <div class="stat-value">—</div>
           <div class="stat-label">Weightage Used</div>
-          <div class="stat-change up">✓ Balanced</div>
+          <div class="stat-change">—</div>
         </div>
       </div>
 
@@ -1303,7 +1382,7 @@
         <div class="card">
           <div class="card-header">
             <span class="card-title">📋 My Goals</span>
-            <button class="btn btn-primary btn-sm" data-add-goal-btn onclick="showModal('addGoalModal')">
+            <button class="btn btn-primary btn-sm" data-add-goal-btn disabled onclick="openAddGoalModal()">
               <i class="fa fa-plus"></i> Add Goal
             </button>
           </div>
@@ -1319,40 +1398,40 @@
             <span class="card-title">📅 Check-in Schedule</span>
           </div>
           <div class="card-body">
-            <div class="checkin-timeline">
+            <div class="checkin-timeline" id="checkinTimeline">
               <div class="timeline-item">
-                <div class="timeline-dot done"><i class="fa fa-check"></i></div>
+                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
                 <div class="timeline-content">
                   <h4>Phase 1 — Goal Setting</h4>
-                  <p>May 2025 · Goals submitted & approved ✓</p>
+                  <p>—</p>
                 </div>
               </div>
               <div class="timeline-item">
-                <div class="timeline-dot current"><i class="fa fa-circle"></i></div>
+                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
                 <div class="timeline-content">
                   <h4>Q1 Check-in</h4>
-                  <p>July 2025 · <strong style="color:var(--accent)">Active Now</strong> — Update your progress!</p>
+                  <p>—</p>
                 </div>
               </div>
               <div class="timeline-item">
                 <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
                 <div class="timeline-content">
                   <h4>Q2 Check-in</h4>
-                  <p>October 2025 · Progress update</p>
+                  <p>—</p>
                 </div>
               </div>
               <div class="timeline-item">
                 <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
                 <div class="timeline-content">
                   <h4>Q3 Check-in</h4>
-                  <p>January 2026 · Progress update</p>
+                  <p>—</p>
                 </div>
               </div>
               <div class="timeline-item">
-                <div class="timeline-dot upcoming"><i class="fa fa-flag-checkered"></i></div>
+                <div class="timeline-dot upcoming"><i class="fa fa-circle"></i></div>
                 <div class="timeline-content">
                   <h4>Q4 / Annual</h4>
-                  <p>March–April 2026 · Final achievement capture</p>
+                  <p>—</p>
                 </div>
               </div>
             </div>
@@ -1362,7 +1441,7 @@
 
       <div class="card">
         <div class="card-header">
-          <span class="card-title">📊 Q1 Achievement Summary</span>
+          <span class="card-title" id="employeeAchievementSummaryTitle">📊 Achievement Summary</span>
           <button class="btn btn-outline btn-sm" onclick="exportReportCSV()"><i class="fa fa-download"></i> Export CSV</button>
         </div>
         <div class="table-wrap">
@@ -1418,7 +1497,7 @@
         <div class="card-header">
           <span class="card-title">My Goal Sheet</span>
           <div style="display:flex;gap:8px">
-            <button class="btn btn-outline btn-sm" data-add-goal-btn onclick="showModal('addGoalModal')">
+            <button class="btn btn-outline btn-sm" data-add-goal-btn disabled onclick="openAddGoalModal()">
               <i class="fa fa-plus"></i> Add Goal
             </button>
             <button class="btn btn-success btn-sm" onclick="submitGoals()">
@@ -1444,6 +1523,20 @@
               <!-- JS -->
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:20px">
+        <div class="card-header">
+          <span class="card-title">🔓 My Unlock Requests</span>
+          <button class="btn btn-outline btn-sm" onclick="loadMyUnlockRequests()">
+            <i class="fa fa-refresh"></i> Refresh
+          </button>
+        </div>
+        <div class="card-body">
+          <div id="myUnlockRequestsList">
+            <p style="color:var(--text-muted)">Click Refresh to see your unlock request history and status.</p>
+          </div>
         </div>
       </div>
     </div>
@@ -1554,6 +1647,11 @@
 
     <!-- ===== PAGE: ADMIN DASHBOARD ===== -->
     <div class="page" id="pg-admin-dashboard">
+      <div class="alert alert-warning" id="pendingUnlockAlert" style="display:none;margin-bottom:16px;align-items:center;gap:12px">
+        <i class="fa fa-unlock-alt"></i>
+        <span><strong id="pendingUnlockCount">0</strong> goal unlock request(s) pending your review.</span>
+        <button class="btn btn-warning btn-sm" onclick="navigateTo('admin-unlock-requests')">Review Now →</button>
+      </div>
       <div class="alert alert-warning">
         <i class="fa fa-exclamation-triangle"></i>
         <span id="adminNotSubmittedAlert"><strong>—</strong> employees have not submitted goals yet.</span>
@@ -1881,6 +1979,33 @@
       </div>
     </div>
 
+    <!-- ===== PAGE: ADMIN UNLOCK REQUESTS ===== -->
+    <div class="page" id="pg-admin-unlock-requests">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">🔓 Goal Unlock Requests
+            <span class="chip orange" id="unlockRequestsBadge" style="margin-left:8px">—</span>
+          </span>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-outline btn-sm" onclick="loadAdminUnlockRequests(false)">Pending Only</button>
+            <button class="btn btn-outline btn-sm" onclick="loadAdminUnlockRequests(true)">Show All</button>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0">
+          <table>
+            <thead>
+              <tr>
+                <th>Employee</th><th>Goal</th><th>Reason</th>
+                <th>Requested</th><th>Status</th><th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="unlockRequestsTable">
+              <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
 
   </div><!-- end main-content -->
 </div><!-- end app -->
@@ -2103,10 +2228,44 @@
       <button class="btn btn-primary" onclick="saveEditGoal()">Save</button></div>
   </div>
 </div>
+
+<div class="modal-overlay" id="unlockRequestModal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">🔓 Request Goal Unlock</span>
+      <div class="modal-close" onclick="closeModal('unlockRequestModal')"><i class="fa fa-times"></i></div>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="unlockRequestGoalId" />
+      <div id="unlockRequestError" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.15);color:#ef4444;font-size:13px"></div>
+      <div class="alert alert-warning" style="margin-bottom:16px">
+        <i class="fa fa-info-circle"></i>
+        This request will be sent to <strong>Admin/HR</strong> for review.
+        Your goal stays locked until approved.
+      </div>
+      <div class="form-group">
+        <label>Goal</label>
+        <p style="font-weight:700;font-size:14px;margin:4px 0" id="unlockRequestGoalTitle">—</p>
+      </div>
+      <div class="form-group">
+        <label>Reason for Unlock <span style="color:var(--danger)">*</span></label>
+        <textarea class="form-control" id="unlockRequestReason" style="min-height:100px"
+          placeholder="Why do you need this goal unlocked? (e.g. target revision, data correction)..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal('unlockRequestModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="submitUnlockRequest()">
+        <i class="fa fa-paper-plane"></i> Send Request
+      </button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="viewSheetModal">
   <div class="modal"><div class="modal-header"><span class="modal-title" id="viewSheetTitle">Goals</span>
     <div class="modal-close" onclick="closeModal('viewSheetModal')"><i class="fa fa-times"></i></div></div>
-    <div class="modal-body" id="viewSheetBody"></div>
+    <div class="modal-body" id="viewSheetBody" style="max-height:60vh;overflow-y:auto;"></div>
     <div class="modal-footer"><button class="btn btn-outline" onclick="closeModal('viewSheetModal')">Close</button></div>
   </div>
 </div>

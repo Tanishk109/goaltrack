@@ -57,6 +57,15 @@ const Goals = {
   return: (sheetId, note) => apiFetch(`/goals/return/${sheetId}`, { method: 'POST', body: { note } }),
   returnForRework: (sheetId, note) => Goals.return(sheetId, note),
   unlock: (id, reason) => apiFetch(`/goals/unlock/${id}`, { method: 'POST', body: { reason } }),
+  requestUnlock: (goalId, reason) =>
+    apiFetch(`/goals/unlock-request/${goalId}`, { method: 'POST', body: { reason } }),
+  myUnlockRequests: () => apiFetch('/goals/my-unlock-requests'),
+  unlockRequests: (all = false) =>
+    apiFetch('/goals/unlock-requests' + (all ? '?all=1' : '')),
+  approveUnlockRequest: (id, adminNote) =>
+    apiFetch(`/goals/unlock-requests/${id}/approve`, { method: 'PATCH', body: { adminNote } }),
+  rejectUnlockRequest: (id, adminNote) =>
+    apiFetch(`/goals/unlock-requests/${id}/reject`, { method: 'PATCH', body: { adminNote } }),
   pushShared: (payload) => apiFetch('/goals/push-shared', { method: 'POST', body: payload }),
 };
 
