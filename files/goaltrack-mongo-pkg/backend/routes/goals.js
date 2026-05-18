@@ -4,6 +4,8 @@ const { Goal, GoalSheet } = require('../models/Goal');
 const Cycle    = require('../models/Cycle');
 const { authenticate, authorize, logAudit } = require('../middleware/auth');
 const { UnlockRequest } = require('../models/AuditLog');
+const { CheckInPeriod, CheckInAssignment } = require('../models/CheckInPeriod');
+const { refreshAssignmentStatuses } = require('./checkins');
 
 const router = express.Router();
 
@@ -178,7 +180,23 @@ router.post('/submit/:sheet_id', authenticate, authorize('employee'), async (req
     if (!sheet) return res.status(404).json({ error: 'Sheet not found.' });
 
     const cycle = await Cycle.findById(sheet.cycle);
-    if (cycle && cycle.goalCloseDate && new Date() > new Date(cycle.goalCloseDate)) {
+    const gsPeriod = await CheckInPeriod.findOne({
+      cycle: sheet.cycle,
+      phase: 'goal_setting',
+      status: 'active',
+    });
+    if (gsPeriod) {
+      const assignment = await CheckInAssignment.findOne({
+        period: gsPeriod._id,
+        employee: req.user._id,
+      });
+      if (!assignment) {
+        return res.status(403).json({ error: 'Goal setting has not been launched for you. Contact your manager or HR.' });
+      }
+      if (new Date() > gsPeriod.deadline) {
+        return res.status(400).json({ error: 'Goal setting deadline has passed.' });
+      }
+    } else if (cycle && cycle.goalCloseDate && new Date() > new Date(cycle.goalCloseDate)) {
       return res.status(400).json({ error: 'Goal submission window is closed.' });
     }
 
@@ -195,6 +213,11 @@ router.post('/submit/:sheet_id', authenticate, authorize('employee'), async (req
     await sheet.save();
 
     logAudit(req.user._id, 'SHEET_SUBMITTED', 'goal_sheet', sheet._id, null, { total, goalCount }, req.ip);
+
+    if (gsPeriod) {
+      await refreshAssignmentStatuses(gsPeriod._id);
+    }
+
     res.json({ message: 'Submitted for manager approval.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -254,11 +277,39 @@ router.post('/return/:sheet_id', authenticate, authorize('manager', 'admin'), as
 router.post('/unlock/:id', authenticate, authorize('admin'), async (req, res) => {
   try {
     const { reason } = req.body;
-    const goal = await Goal.findByIdAndUpdate(req.params.id, { $set: { locked: false } }, { new: true });
+    const goal = await Goal.findById(req.params.id).populate('sheet');
     if (!goal) return res.status(404).json({ error: 'Goal not found.' });
+    if (goal.sheet?.status !== 'approved') {
+      return res.status(400).json({ error: 'Only goals on approved sheets can be unlocked.' });
+    }
+    if (!isGoalLocked(goal)) {
+      return res.status(400).json({ error: 'Goal is already unlocked.' });
+    }
 
+    const updated = await Goal.findByIdAndUpdate(goal._id, { $set: { locked: false } }, { new: true });
     logAudit(req.user._id, 'GOAL_UNLOCKED', 'goal', goal._id, { locked: true }, { locked: false, reason }, req.ip);
-    res.json({ message: `Goal unlocked.`, reason, goal });
+    res.json({ message: 'Goal unlocked.', reason, goal: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/goals/lock/:id  (Admin) ──────────────────────────────────────
+router.post('/lock/:id', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const goal = await Goal.findById(req.params.id).populate('sheet');
+    if (!goal) return res.status(404).json({ error: 'Goal not found.' });
+    if (goal.sheet?.status !== 'approved') {
+      return res.status(400).json({ error: 'Only goals on approved sheets can be re-locked.' });
+    }
+    if (isGoalLocked(goal)) {
+      return res.status(400).json({ error: 'Goal is already locked.' });
+    }
+
+    const updated = await Goal.findByIdAndUpdate(goal._id, { $set: { locked: true } }, { new: true });
+    logAudit(req.user._id, 'GOAL_LOCKED', 'goal', goal._id, { locked: false }, { locked: true, reason }, req.ip);
+    res.json({ message: 'Goal locked.', reason, goal: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -345,6 +396,9 @@ router.post('/unlock-request/:goal_id', authenticate, authorize('employee'), asy
       return res.status(403).json({ error: 'Not your goal.' });
     }
 
+    if (goal.sheet?.status !== 'approved') {
+      return res.status(400).json({ error: 'Unlock requests apply only to approved goal sheets.' });
+    }
     if (!isGoalLocked(goal)) {
       return res.status(400).json({ error: 'This goal is not locked.' });
     }
@@ -383,7 +437,7 @@ router.post('/unlock-request/:goal_id', authenticate, authorize('employee'), asy
 // ─── GET /api/goals/unlock-requests — Admin sees all pending requests ─────────
 router.get('/unlock-requests', authenticate, authorize('admin'), async (req, res) => {
   try {
-    const filter = { status: req.query.all === '1' ? { $exists: true } : 'pending' };
+    const filter = req.query.all === '1' ? {} : { status: 'pending' };
     const requests = await UnlockRequest.find(filter)
       .populate('goal', 'title thrustArea targetValue weightage locked')
       .populate('employee', 'name email department')

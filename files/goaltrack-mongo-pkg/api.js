@@ -57,6 +57,7 @@ const Goals = {
   return: (sheetId, note) => apiFetch(`/goals/return/${sheetId}`, { method: 'POST', body: { note } }),
   returnForRework: (sheetId, note) => Goals.return(sheetId, note),
   unlock: (id, reason) => apiFetch(`/goals/unlock/${id}`, { method: 'POST', body: { reason } }),
+  lock: (id, reason) => apiFetch(`/goals/lock/${id}`, { method: 'POST', body: { reason } }),
   requestUnlock: (goalId, reason) =>
     apiFetch(`/goals/unlock-request/${goalId}`, { method: 'POST', body: { reason } }),
   myUnlockRequests: () => apiFetch('/goals/my-unlock-requests'),
@@ -67,6 +68,21 @@ const Goals = {
   rejectUnlockRequest: (id, adminNote) =>
     apiFetch(`/goals/unlock-requests/${id}/reject`, { method: 'PATCH', body: { adminNote } }),
   pushShared: (payload) => apiFetch('/goals/push-shared', { method: 'POST', body: payload }),
+};
+
+const CheckIns = {
+  schedule: (cycleId) =>
+    apiFetch('/checkins/schedule' + (cycleId ? `?cycle_id=${cycleId}` : '')),
+  periods: (cycleId) =>
+    apiFetch('/checkins/periods' + (cycleId ? `?cycle_id=${cycleId}` : '')),
+  launch: (payload) => apiFetch('/checkins/launch', { method: 'POST', body: payload }),
+  closePeriod: (id) => apiFetch(`/checkins/periods/${id}/close`, { method: 'PATCH' }),
+  myAssignments: () => apiFetch('/checkins/my-assignments'),
+  activeForMe: (phase, cycleId) => {
+    const q = new URLSearchParams({ phase });
+    if (cycleId) q.set('cycle_id', cycleId);
+    return apiFetch(`/checkins/active-for-me?${q}`);
+  },
 };
 
 const Achievements = {
@@ -118,4 +134,4 @@ const Admin = {
   },
 };
 
-if (typeof module !== 'undefined') module.exports = { Auth, Goals, Achievements, Admin };
+if (typeof module !== 'undefined') module.exports = { Auth, Goals, Achievements, CheckIns, Admin };

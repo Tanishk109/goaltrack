@@ -12,14 +12,47 @@
       document.documentElement.setAttribute('data-theme', t);
     })();
     var VALID_THEMES = ['dark', 'light', 'midnight', 'forest'];
+    var THEME_LABELS = { dark: 'Dark', light: 'Light', midnight: 'Midnight', forest: 'Forest' };
     function setTheme(name) {
       if (VALID_THEMES.indexOf(name) === -1) return;
       document.documentElement.setAttribute('data-theme', name);
       localStorage.setItem('gt_theme', name);
-      document.querySelectorAll('.theme-swatch').forEach(function (btn) {
-        btn.classList.toggle('active', btn.dataset.theme === name);
+      document.querySelectorAll('.theme-dropdown-option').forEach(function (btn) {
+        var on = btn.dataset.theme === name;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      document.querySelectorAll('.theme-dropdown-current').forEach(function (el) {
+        el.textContent = THEME_LABELS[name] || name;
+      });
+      closeAllThemeDropdowns();
+    }
+    function closeAllThemeDropdowns() {
+      document.querySelectorAll('.theme-dropdown').forEach(function (dd) {
+        dd.classList.remove('open');
+        var t = dd.querySelector('.theme-dropdown-toggle');
+        if (t) t.setAttribute('aria-expanded', 'false');
       });
     }
+    function toggleThemeDropdown(ev) {
+      ev.stopPropagation();
+      var dd = ev.currentTarget.closest('.theme-dropdown');
+      if (!dd) return;
+      var willOpen = !dd.classList.contains('open');
+      closeAllThemeDropdowns();
+      if (willOpen) {
+        dd.classList.add('open');
+        ev.currentTarget.setAttribute('aria-expanded', 'true');
+      }
+    }
+    function pickTheme(name, ev) {
+      if (ev) ev.stopPropagation();
+      setTheme(name);
+    }
+    document.addEventListener('click', closeAllThemeDropdowns);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeAllThemeDropdowns();
+    });
     setTheme(localStorage.getItem('gt_theme') || 'dark');
   </script>
   <style>
@@ -126,7 +159,7 @@
       overflow: hidden;
     }
 
-    #loginPage .theme-picker-login {
+    #loginPage .theme-dropdown-login {
       position: absolute;
       top: 20px;
       right: 20px;
@@ -1115,51 +1148,120 @@
       .three-col { grid-template-columns: 1fr; }
     }
 
-    /* ===== THEME PICKER ===== */
-    .theme-picker {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
+    /* ===== THEME DROPDOWN ===== */
+    .theme-dropdown {
+      position: relative;
+      display: inline-block;
     }
 
-    .theme-picker-label {
+    .theme-dropdown-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+
+    .theme-dropdown-toggle:hover {
+      border-color: var(--primary);
+    }
+
+    .theme-dropdown.open .theme-dropdown-toggle {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(var(--primary-rgb), 0.2);
+    }
+
+    .theme-dropdown-chevron {
       font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
       color: var(--text-muted);
+      transition: transform 0.2s;
     }
 
-    .theme-options {
+    .theme-dropdown.open .theme-dropdown-chevron {
+      transform: rotate(180deg);
+    }
+
+    .theme-dropdown-menu {
+      display: none;
+      position: absolute;
+      z-index: 200;
+      min-width: 168px;
+      margin-top: 6px;
+      padding: 6px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 12px 32px var(--shadow-heavy);
+    }
+
+    .theme-dropdown.open .theme-dropdown-menu {
+      display: block;
+    }
+
+    .theme-dropdown-menu-up {
+      bottom: calc(100% + 6px);
+      top: auto;
+      margin-top: 0;
+    }
+
+    .theme-dropdown-option {
       display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 8px 10px;
+      border: none;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: left;
+      cursor: pointer;
+      transition: background 0.12s;
+    }
+
+    .theme-dropdown-option:hover {
+      background: var(--surface-hover, rgba(var(--primary-rgb), 0.08));
+    }
+
+    .theme-dropdown-option.active {
+      background: rgba(var(--primary-rgb), 0.12);
+      color: var(--primary);
+    }
+
+    .theme-dropdown-check {
+      margin-left: auto;
+      font-size: 12px;
+      opacity: 0;
+      color: var(--primary);
+    }
+
+    .theme-dropdown-option.active .theme-dropdown-check {
+      opacity: 1;
     }
 
     .theme-swatch {
-      width: 32px;
-      height: 32px;
-      border-radius: 10px;
-      border: 2px solid var(--border);
-      cursor: pointer;
-      padding: 0;
+      flex-shrink: 0;
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
       position: relative;
-      transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
       overflow: hidden;
     }
 
-    .theme-swatch:hover {
-      transform: scale(1.08);
-      border-color: var(--primary);
-    }
-
-    .theme-swatch.active {
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(var(--primary-rgb), 0.35);
-    }
-
-    .theme-swatch::before,
-    .theme-swatch::after {
+    .theme-swatch::before {
       content: '';
       position: absolute;
       inset: 0;
@@ -1181,49 +1283,55 @@
       background: linear-gradient(135deg, #0a1612 50%, #059669 50%);
     }
 
-    .theme-picker-login {
-      z-index: 20;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 12px 14px;
-      box-shadow: 0 8px 24px var(--shadow-heavy);
+    .theme-dropdown-login .theme-dropdown-menu {
+      right: 0;
+      left: auto;
     }
 
-    .theme-picker-sidebar {
+    .theme-dropdown-sidebar {
       padding: 0 12px 14px;
       border-bottom: 1px solid var(--border);
       margin-bottom: 12px;
+      display: block;
+      width: calc(100% - 24px);
+      margin-left: 12px;
+      margin-right: 12px;
     }
 
-    .theme-picker-topbar {
-      display: flex;
-      align-items: center;
-      gap: 6px;
+    .theme-dropdown-sidebar .theme-dropdown-toggle {
+      width: 100%;
+      justify-content: space-between;
     }
 
-    .theme-picker-topbar .theme-swatch {
-      width: 28px;
-      height: 28px;
-      border-radius: 8px;
+    .theme-dropdown-sidebar .theme-dropdown-menu {
+      left: 0;
+      right: 0;
+      min-width: 100%;
     }
 
-    .theme-picker-topbar .theme-picker-label {
-      display: none;
+    .theme-dropdown-topbar .theme-dropdown-toggle {
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+
+    .theme-dropdown-topbar .theme-dropdown-menu {
+      right: 0;
+      left: auto;
     }
 
     .page.is-loading { opacity: 0.55; pointer-events: none; }
     .page-error-banner { margin-bottom: 20px; }
 
     @media (max-width: 768px) {
-      .theme-picker-login {
+      .theme-dropdown-login {
         top: auto;
         bottom: 16px;
         right: 16px;
-        left: 16px;
+        left: auto;
       }
-      .theme-picker-login .theme-options {
-        justify-content: center;
+      .theme-dropdown-login .theme-dropdown-menu {
+        bottom: calc(100% + 6px);
+        top: auto;
       }
     }
   </style>
@@ -1232,13 +1340,17 @@
 
 <!-- ========== LOGIN PAGE ========== -->
 <div id="loginPage">
-  <div class="theme-picker theme-picker-login" aria-label="Theme selection">
-    <span class="theme-picker-label"><i class="fa fa-palette"></i> Theme</span>
-    <div class="theme-options">
-      <button type="button" class="theme-swatch" data-theme="dark" title="Dark" aria-label="Dark theme" onclick="setTheme('dark')"></button>
-      <button type="button" class="theme-swatch" data-theme="light" title="Light" aria-label="Light theme" onclick="setTheme('light')"></button>
-      <button type="button" class="theme-swatch" data-theme="midnight" title="Midnight" aria-label="Midnight theme" onclick="setTheme('midnight')"></button>
-      <button type="button" class="theme-swatch" data-theme="forest" title="Forest" aria-label="Forest theme" onclick="setTheme('forest')"></button>
+  <div class="theme-dropdown theme-dropdown-login" aria-label="Theme selection">
+    <button type="button" class="theme-dropdown-toggle" onclick="toggleThemeDropdown(event)" aria-haspopup="listbox" aria-expanded="false">
+      <i class="fa fa-palette"></i>
+      <span class="theme-dropdown-current">Dark</span>
+      <i class="fa fa-chevron-down theme-dropdown-chevron"></i>
+    </button>
+    <div class="theme-dropdown-menu" role="listbox" aria-label="Choose theme">
+      <button type="button" class="theme-dropdown-option" data-theme="dark" role="option" onclick="pickTheme('dark', event)"><span class="theme-swatch" data-theme="dark"></span> Dark <i class="fa fa-check theme-dropdown-check"></i></button>
+      <button type="button" class="theme-dropdown-option" data-theme="light" role="option" onclick="pickTheme('light', event)"><span class="theme-swatch" data-theme="light"></span> Light <i class="fa fa-check theme-dropdown-check"></i></button>
+      <button type="button" class="theme-dropdown-option" data-theme="midnight" role="option" onclick="pickTheme('midnight', event)"><span class="theme-swatch" data-theme="midnight"></span> Midnight <i class="fa fa-check theme-dropdown-check"></i></button>
+      <button type="button" class="theme-dropdown-option" data-theme="forest" role="option" onclick="pickTheme('forest', event)"><span class="theme-swatch" data-theme="forest"></span> Forest <i class="fa fa-check theme-dropdown-check"></i></button>
     </div>
   </div>
   <div class="login-card">
@@ -1300,15 +1412,20 @@
       <!-- Filled by JS based on role -->
     </nav>
 
-    <div class="theme-picker theme-picker-sidebar" aria-label="Theme selection">
-      <span class="theme-picker-label"><i class="fa fa-palette"></i> Theme</span>
-      <div class="theme-options">
-        <button type="button" class="theme-swatch" data-theme="dark" title="Dark" onclick="setTheme('dark')"></button>
-        <button type="button" class="theme-swatch" data-theme="light" title="Light" onclick="setTheme('light')"></button>
-        <button type="button" class="theme-swatch" data-theme="midnight" title="Midnight" onclick="setTheme('midnight')"></button>
-        <button type="button" class="theme-swatch" data-theme="forest" title="Forest" onclick="setTheme('forest')"></button>
+    <div class="theme-dropdown theme-dropdown-sidebar" aria-label="Theme selection">
+        <button type="button" class="theme-dropdown-toggle" onclick="toggleThemeDropdown(event)" aria-haspopup="listbox" aria-expanded="false">
+          <i class="fa fa-palette"></i>
+          <span class="theme-dropdown-current">Dark</span>
+          <i class="fa fa-chevron-down theme-dropdown-chevron"></i>
+        </button>
+        <div class="theme-dropdown-menu" role="listbox" aria-label="Choose theme">
+          <button type="button" class="theme-dropdown-option" data-theme="dark" role="option" onclick="pickTheme('dark', event)"><span class="theme-swatch" data-theme="dark"></span> Dark <i class="fa fa-check theme-dropdown-check"></i></button>
+          <button type="button" class="theme-dropdown-option" data-theme="light" role="option" onclick="pickTheme('light', event)"><span class="theme-swatch" data-theme="light"></span> Light <i class="fa fa-check theme-dropdown-check"></i></button>
+          <button type="button" class="theme-dropdown-option" data-theme="midnight" role="option" onclick="pickTheme('midnight', event)"><span class="theme-swatch" data-theme="midnight"></span> Midnight <i class="fa fa-check theme-dropdown-check"></i></button>
+          <button type="button" class="theme-dropdown-option" data-theme="forest" role="option" onclick="pickTheme('forest', event)"><span class="theme-swatch" data-theme="forest"></span> Forest <i class="fa fa-check theme-dropdown-check"></i></button>
+        </div>
       </div>
-    </div>
+
 
     <div class="sidebar-footer">
       <button class="btn btn-outline" style="width:100%" onclick="doLogout()">
@@ -1322,12 +1439,17 @@
     <div class="topbar">
       <div class="topbar-title" id="topbarTitle">Dashboard</div>
       <div class="topbar-actions">
-        <div class="theme-picker theme-picker-topbar" aria-label="Theme selection">
-          <div class="theme-options">
-            <button type="button" class="theme-swatch" data-theme="dark" title="Dark" onclick="setTheme('dark')"></button>
-            <button type="button" class="theme-swatch" data-theme="light" title="Light" onclick="setTheme('light')"></button>
-            <button type="button" class="theme-swatch" data-theme="midnight" title="Midnight" onclick="setTheme('midnight')"></button>
-            <button type="button" class="theme-swatch" data-theme="forest" title="Forest" onclick="setTheme('forest')"></button>
+        <div class="theme-dropdown theme-dropdown-topbar" aria-label="Theme selection">
+          <button type="button" class="theme-dropdown-toggle" onclick="toggleThemeDropdown(event)" aria-haspopup="listbox" aria-expanded="false">
+            <i class="fa fa-palette"></i>
+            <span class="theme-dropdown-current">Dark</span>
+            <i class="fa fa-chevron-down theme-dropdown-chevron"></i>
+          </button>
+          <div class="theme-dropdown-menu" role="listbox" aria-label="Choose theme">
+            <button type="button" class="theme-dropdown-option" data-theme="dark" role="option" onclick="pickTheme('dark', event)"><span class="theme-swatch" data-theme="dark"></span> Dark <i class="fa fa-check theme-dropdown-check"></i></button>
+            <button type="button" class="theme-dropdown-option" data-theme="light" role="option" onclick="pickTheme('light', event)"><span class="theme-swatch" data-theme="light"></span> Light <i class="fa fa-check theme-dropdown-check"></i></button>
+            <button type="button" class="theme-dropdown-option" data-theme="midnight" role="option" onclick="pickTheme('midnight', event)"><span class="theme-swatch" data-theme="midnight"></span> Midnight <i class="fa fa-check theme-dropdown-check"></i></button>
+            <button type="button" class="theme-dropdown-option" data-theme="forest" role="option" onclick="pickTheme('forest', event)"><span class="theme-swatch" data-theme="forest"></span> Forest <i class="fa fa-check theme-dropdown-check"></i></button>
           </div>
         </div>
         <div class="notif-wrap">

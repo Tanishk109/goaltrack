@@ -4,8 +4,35 @@ const { Goal, GoalSheet } = require('../models/Goal');
 const { CheckIn } = require('../models/AuditLog');
 const { authenticate, authorize } = require('../middleware/auth');
 const { computeScore } = require('../middleware/scoring');
+const { CheckInPeriod, CheckInAssignment } = require('../models/CheckInPeriod');
+const { refreshAssignmentStatuses } = require('./checkins');
 
 const router = express.Router();
+
+async function requireLaunchedCheckin(employeeId, cycleId, quarter) {
+  const period = await CheckInPeriod.findOne({
+    cycle: cycleId,
+    phase: quarter,
+    status: 'active',
+  });
+  if (!period) {
+    return { ok: false, error: `${quarter} check-in has not been launched yet. Wait for your manager or HR to open the window.` };
+  }
+  const assignment = await CheckInAssignment.findOne({
+    period: period._id,
+    employee: employeeId,
+  });
+  if (!assignment) {
+    return { ok: false, error: 'You are not included in this check-in round.' };
+  }
+  if (assignment.status === 'submitted') {
+    return { ok: false, error: 'You have already completed this check-in.' };
+  }
+  if (new Date() > period.deadline) {
+    return { ok: false, error: `Check-in deadline was ${period.deadline.toLocaleDateString()}.` };
+  }
+  return { ok: true, period, assignment };
+}
 
 // ─── POST /api/achievements — save/update quarterly achievement ───────────────
 router.post('/', authenticate, authorize('employee'), async (req, res) => {
@@ -23,7 +50,13 @@ router.post('/', authenticate, authorize('employee'), async (req, res) => {
 
     const sheet = await GoalSheet.findById(goal.sheet._id).populate('cycle');
     const cycle = sheet?.cycle;
-    if (cycle) {
+
+    if (sheet?.status === 'approved') {
+      const launchCheck = await requireLaunchedCheckin(req.user._id, cycle._id, quarter);
+      if (!launchCheck.ok) {
+        return res.status(403).json({ error: launchCheck.error });
+      }
+    } else if (cycle) {
       const now = new Date();
       const windowMap = { Q1: cycle.q1Open, Q2: cycle.q2Open, Q3: cycle.q3Open, Q4: cycle.q4Open };
       const windowOpen = windowMap[quarter];
@@ -45,6 +78,13 @@ router.post('/', authenticate, authorize('employee'), async (req, res) => {
     }
 
     await goal.save();
+
+    if (sheet?.status === 'approved' && cycle) {
+      const period = await CheckInPeriod.findOne({ cycle: cycle._id, phase: quarter, status: 'active' });
+      if (period) {
+        await refreshAssignmentStatuses(period._id);
+      }
+    }
 
     // If this is a shared goal, sync achievement to all siblings (same sharedFrom source)
     if (goal.isShared && goal.sharedFrom) {

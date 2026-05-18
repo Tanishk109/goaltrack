@@ -251,11 +251,39 @@ router.post('/return/:sheet_id', authenticate, authorize('manager', 'admin'), as
 router.post('/unlock/:id', authenticate, authorize('admin'), async (req, res) => {
   try {
     const { reason } = req.body;
-    const goal = await Goal.findByIdAndUpdate(req.params.id, { $set: { locked: false } }, { new: true });
+    const goal = await Goal.findById(req.params.id).populate('sheet');
     if (!goal) return res.status(404).json({ error: 'Goal not found.' });
+    if (goal.sheet?.status !== 'approved') {
+      return res.status(400).json({ error: 'Only goals on approved sheets can be unlocked.' });
+    }
+    if (!isGoalLocked(goal)) {
+      return res.status(400).json({ error: 'Goal is already unlocked.' });
+    }
 
+    const updated = await Goal.findByIdAndUpdate(goal._id, { $set: { locked: false } }, { new: true });
     logAudit(req.user._id, 'GOAL_UNLOCKED', 'goal', goal._id, { locked: true }, { locked: false, reason }, req.ip);
-    res.json({ message: `Goal unlocked.`, reason, goal });
+    res.json({ message: 'Goal unlocked.', reason, goal: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/goals/lock/:id  (Admin) ──────────────────────────────────────
+router.post('/lock/:id', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const goal = await Goal.findById(req.params.id).populate('sheet');
+    if (!goal) return res.status(404).json({ error: 'Goal not found.' });
+    if (goal.sheet?.status !== 'approved') {
+      return res.status(400).json({ error: 'Only goals on approved sheets can be re-locked.' });
+    }
+    if (isGoalLocked(goal)) {
+      return res.status(400).json({ error: 'Goal is already locked.' });
+    }
+
+    const updated = await Goal.findByIdAndUpdate(goal._id, { $set: { locked: true } }, { new: true });
+    logAudit(req.user._id, 'GOAL_LOCKED', 'goal', goal._id, { locked: false }, { locked: true, reason }, req.ip);
+    res.json({ message: 'Goal locked.', reason, goal: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -342,6 +370,9 @@ router.post('/unlock-request/:goal_id', authenticate, authorize('employee'), asy
       return res.status(403).json({ error: 'Not your goal.' });
     }
 
+    if (goal.sheet?.status !== 'approved') {
+      return res.status(400).json({ error: 'Unlock requests apply only to approved goal sheets.' });
+    }
     if (!isGoalLocked(goal)) {
       return res.status(400).json({ error: 'This goal is not locked.' });
     }

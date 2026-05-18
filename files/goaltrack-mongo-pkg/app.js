@@ -20,6 +20,8 @@ let checkinsByEmpId = {};
 let viewSheetContext = { sheetId: null, employeeName: '' };
 let pendingMySheetLoad = null;
 let adminUnlockRequestsShowAll = false;
+/** Goal IDs with a pending unlock request (employee). */
+let pendingUnlockGoalIds = new Set();
 let appNotifications = [];
 
 async function loadCheckinsForEmployees(empIds, { force = false } = {}) {
@@ -538,10 +540,18 @@ function notifySheetStatusChange(prevStatus) {
 
 async function refreshEmployeeData({ silent = false } = {}) {
   const prevStatus = currentSheet?.status;
-  const [data, cycleRes] = await Promise.all([
+  const [data, cycleRes, unlockRes] = await Promise.all([
     fetchMySheetData(),
     Admin.activeCycle().catch(() => ({ cycle: null })),
+    currentRole === 'employee'
+      ? Goals.myUnlockRequests().catch(() => ({ requests: [] }))
+      : Promise.resolve({ requests: [] }),
   ]);
+  pendingUnlockGoalIds = new Set(
+    (unlockRes.requests || [])
+      .filter((r) => r.status === 'pending')
+      .map((r) => normalizeId(r.goal?._id || r.goal)),
+  );
   if (cycleRes.cycle) activeCycle = cycleRes.cycle;
   currentQuarter = inferCurrentQuarter(activeCycle);
   if (silent) notifySheetStatusChange(prevStatus);
@@ -650,6 +660,32 @@ function isGoalLocked(g, sheetStatus) {
   return !!g.locked;
 }
 
+/** True when employee may edit goal title/target/weightage (not quarterly progress). */
+function canEditGoalDefinition(g) {
+  if (!g || !currentSheet) return false;
+  const sheetSt = currentSheet.status;
+  if (['draft', 'returned'].includes(sheetSt)) return !isGoalLocked(g, sheetSt);
+  if (sheetSt === 'approved') {
+    const raw = g._raw || g;
+    return raw.locked === false;
+  }
+  return false;
+}
+
+function hasPendingUnlockRequest(goalId) {
+  return pendingUnlockGoalIds.has(normalizeId(goalId));
+}
+
+function unlockRequestActionHtml(goalId, goalTitle) {
+  const gid = normalizeId(goalId);
+  if (hasPendingUnlockRequest(gid)) {
+    return '<span class="chip orange" style="font-size:11px">⏳ Unlock pending review</span>';
+  }
+  const titleArg = JSON.stringify(goalTitle || 'Goal');
+  return `<button type="button" class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 8px"
+    onclick="openUnlockRequestModal('${gid}', ${titleArg})"><i class="fa fa-lock"></i> Request Unlock</button>`;
+}
+
 function mapGoalFromApi(g, sheetStatus, quarter = currentQuarter) {
   const ach = getAchForQuarter(g, quarter);
   const locked = isGoalLocked(g, sheetStatus);
@@ -659,7 +695,7 @@ function mapGoalFromApi(g, sheetStatus, quarter = currentQuarter) {
   else if (sheetStatus === 'returned') status = 'draft';
 
   return {
-    id: g._id,
+    id: normalizeId(g._id || g.id),
     _raw: g,
     thrust: g.thrustArea,
     title: g.title,
@@ -1012,9 +1048,12 @@ function renderGoals() {
             <span style="font-weight:700">${esc(g.achievement)}</span>
           </div>
           <div class="progress-bar"><div class="progress-fill ${getProgressClass(g)}" style="width:${Math.min(getScore(g), 100)}%"></div></div>
-          <div style="display:flex;justify-content:space-between;margin-top:6px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;flex-wrap:wrap;gap:6px">
             <span class="status-badge status-${g.achStatus}">${g.achStatus.replace('-', ' ')}</span>
-            <button class="btn btn-outline btn-sm" onclick="openAchieve('${g.id}')">Update</button>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-outline btn-sm" onclick="openAchieve('${normalizeId(g.id)}')">Update progress</button>
+            ${canEditGoalDefinition(g) ? `<button class="btn btn-primary btn-sm" onclick="openEditGoal('${normalizeId(g.id)}')">Edit goal</button>` : ''}
+            </div>
           </div>
         </div>` : `<div style="font-size:13px;color:var(--text-muted)">${editable ? 'Editable — submit when weightage totals 100%' :
      currentSheet?.status === 'submitted' ? 'Submitted — waiting for manager approval' :
@@ -1022,20 +1061,29 @@ function renderGoals() {
      'Waiting for manager approval'}</div>`}
         ${g.locked && currentRole === 'employee'
     ? `<span class="chip orange" style="font-size:11px;margin-top:4px;display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px">
-         🔒 Locked
-         <button class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 8px"
-           onclick="openUnlockRequestModal('${g.id}', ${JSON.stringify(g.title)})">
-           Request Unlock
-         </button>
+         🔒 Goal locked
+         ${unlockRequestActionHtml(g.id, g.title)}
        </span>`
+    : canEditGoalDefinition(g) && currentRole === 'employee'
+    ? '<span class="chip green" style="font-size:11px;margin-top:4px">🔓 Unlocked for edits</span>'
     : ''}
       </div>`).join('') : '<div class="empty-state"><i class="fa fa-bullseye"></i><p>No goals yet. Add your first goal!</p></div>';
   }
 
   if (table) {
     table.innerHTML = goals.map((g, i) => {
-      const canEdit = editable && !g.locked;
-      const canDel = canEdit && !g.isShared;
+      const gid = normalizeId(g.id);
+      const canEdit = canEditGoalDefinition(g) || (editable && !g.locked);
+      const canDel = editable && !g.locked && !g.isShared;
+      const unlockBtn = g.locked
+        ? currentRole === 'admin'
+          ? `<button class="btn btn-warning btn-sm" onclick="unlockGoal('${gid}')"><i class="fa fa-lock-open"></i> Unlock</button>`
+          : currentRole === 'employee'
+            ? unlockRequestActionHtml(gid, g.title)
+            : ''
+        : currentRole === 'admin' && currentSheet?.status === 'approved'
+          ? `<button class="btn btn-outline btn-sm" onclick="lockGoal('${gid}')"><i class="fa fa-lock"></i> Lock</button>`
+          : '';
       return `<tr>
         <td style="color:var(--text-muted)">${i + 1}</td>
         <td><span class="chip blue">${esc(g.thrust)}</span></td>
@@ -1049,13 +1097,9 @@ function renderGoals() {
       g.status === 'draft' ? 'Draft' : g.status
     }</span></td>
         <td><div style="display:flex;gap:6px;flex-wrap:wrap">
-          ${canEdit ? `<button class="btn btn-outline btn-sm" onclick="openEditGoal('${g.id}')">Edit</button>` : ''}
-          ${canDel ? `<button class="btn btn-danger btn-sm" onclick="deleteGoal('${g.id}')"><i class="fa fa-trash"></i></button>` : ''}
-          ${g.locked
-    ? currentRole === 'admin'
-      ? `<button class="btn btn-warning btn-sm" onclick="unlockGoal('${g.id}')"><i class="fa fa-lock-open"></i> Unlock</button>`
-      : `<button class="btn btn-outline btn-sm" onclick="openUnlockRequestModal('${g.id}', ${JSON.stringify(g.title)})"><i class="fa fa-lock"></i> Request Unlock</button>`
-    : ''}
+          ${canEdit ? `<button class="btn btn-outline btn-sm" onclick="openEditGoal('${gid}')">Edit goal</button>` : ''}
+          ${canDel ? `<button class="btn btn-danger btn-sm" onclick="deleteGoal('${gid}')"><i class="fa fa-trash"></i></button>` : ''}
+          ${unlockBtn}
         </div></td>
       </tr>`;
     }).join('');
@@ -1222,8 +1266,8 @@ async function submitGoals() {
 }
 
 function openAchieve(id) {
-  achieveId = id;
-  const g = goals.find((x) => x.id === id);
+  achieveId = normalizeId(id);
+  const g = goals.find((x) => normalizeId(x.id) === achieveId);
   if (!g) return;
   const errEl = document.getElementById('achieveModalError');
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
@@ -1238,7 +1282,10 @@ function openAchieve(id) {
   const quarter = qSel?.value || currentQuarter;
   const bannerEl = document.querySelector('#achieveModal .alert-info');
   if (bannerEl) {
-    bannerEl.innerHTML = `<i class="fa fa-info-circle"></i> <strong>${quarter}</strong> check-in window. Update your progress for this quarter.`;
+    const lockNote = g.locked
+      ? ' Goal targets are locked — you can update quarterly progress only.'
+      : '';
+    bannerEl.innerHTML = `<i class="fa fa-info-circle"></i> <strong>${quarter}</strong> check-in window. Update your progress for this quarter.${lockNote}`;
   }
   showModal('achieveModal');
 }
@@ -1254,7 +1301,7 @@ async function saveAchievement() {
 
   try {
     const data = await Achievements.save({
-      goal_id: achieveId,
+      goal_id: normalizeId(achieveId),
       quarter,
       actualValue,
       status,
@@ -1273,9 +1320,13 @@ async function saveAchievement() {
 }
 
 function openEditGoal(id) {
-  editGoalId = id;
-  const g = goals.find((x) => x.id === id);
+  editGoalId = normalizeId(id);
+  const g = goals.find((x) => normalizeId(x.id) === editGoalId);
   if (!g) return;
+  if (!canEditGoalDefinition(g)) {
+    showToast('This goal is locked. Request an unlock from Admin/HR.', 'danger');
+    return;
+  }
   document.getElementById('editGoalTitle').textContent = g.title;
   const shared = g.isShared;
   document.getElementById('editGoalTitleInput').value = g.title;
@@ -1294,7 +1345,11 @@ function openEditGoal(id) {
 }
 
 async function saveEditGoal() {
-  const g = goals.find((x) => x.id === editGoalId);
+  const g = goals.find((x) => normalizeId(x.id) === normalizeId(editGoalId));
+  if (!g || !canEditGoalDefinition(g)) {
+    showToast('This goal is locked and cannot be edited.', 'danger');
+    return;
+  }
   const payload = { weightage: parseInt(document.getElementById('editWeightage').value, 10) };
   if (!g?.isShared) {
     payload.thrustArea = document.getElementById('editThrustArea').value.trim();
@@ -1330,6 +1385,16 @@ async function unlockGoal(id) {
   } catch (err) { showToast(err.message, 'danger'); }
 }
 
+async function lockGoal(id) {
+  const reason = prompt('Reason for locking this goal again:');
+  if (!reason) return;
+  try {
+    await Goals.lock(id, reason);
+    showToast('Goal locked.');
+    await loadEmployeeData('employee-goals');
+  } catch (err) { showToast(err.message, 'danger'); }
+}
+
 async function unlockGoalAndRefresh(goalId) {
   const gid = normalizeId(goalId);
   if (!gid) {
@@ -1341,6 +1406,23 @@ async function unlockGoalAndRefresh(goalId) {
   try {
     await Goals.unlock(gid, reason || 'Admin unlock');
     showToast('Goal unlocked.');
+    await viewSheetGoals(viewSheetContext.sheetId, viewSheetContext.employeeName);
+    const page = getActivePageId();
+    if (page === 'admin-employee-goals') await loadAdminEmployeeGoals();
+  } catch (err) { showToast(err.message, 'danger'); }
+}
+
+async function lockGoalAndRefresh(goalId) {
+  const gid = normalizeId(goalId);
+  if (!gid) {
+    showToast('Invalid goal.', 'danger');
+    return;
+  }
+  const reason = prompt('Reason for locking this goal again:');
+  if (!reason) return;
+  try {
+    await Goals.lock(gid, reason);
+    showToast('Goal locked.');
     await viewSheetGoals(viewSheetContext.sheetId, viewSheetContext.employeeName);
     const page = getActivePageId();
     if (page === 'admin-employee-goals') await loadAdminEmployeeGoals();
@@ -1582,7 +1664,7 @@ async function viewSheetGoals(sheetId, employeeName) {
       </div>`;
     } else if (currentRole === 'admin' && sheet?.status === 'approved') {
       sheetActionsHtml = `<p style="font-size:13px;color:var(--text-muted);margin:0 0 12px">
-        <i class="fa fa-info-circle"></i> Use <strong>Unlock</strong> on locked goals below to allow edits (logged to audit trail).
+        <i class="fa fa-info-circle"></i> Use <strong>Unlock</strong> / <strong>Lock</strong> on goals below to control edits (logged to audit trail).
       </p>`;
     }
     const goalsHTML = (gs || []).map((g) => {
@@ -1591,14 +1673,16 @@ async function viewSheetGoals(sheetId, employeeName) {
       const editBtn = canInlineEdit
         ? `<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px" data-inline-edit="1" data-goal-id="${escAttr(goalId)}" data-weightage="${g.weightage}" data-target="${escAttr(targetEnc)}"><i class="fa fa-pencil"></i> Edit</button>`
         : '';
-      const unlockBtn = (currentRole === 'admin' && g.locked)
-        ? `<button type="button" class="btn btn-warning btn-sm" style="margin-top:8px;margin-left:4px" onclick="unlockGoalAndRefresh('${goalId}')"><i class="fa fa-lock-open"></i> Unlock</button>`
+      const lockUnlockBtn = currentRole === 'admin' && sheet?.status === 'approved'
+        ? g.locked
+          ? `<button type="button" class="btn btn-warning btn-sm" style="margin-top:8px;margin-left:4px" onclick="unlockGoalAndRefresh('${goalId}')"><i class="fa fa-lock-open"></i> Unlock</button>`
+          : `<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px;margin-left:4px" onclick="lockGoalAndRefresh('${goalId}')"><i class="fa fa-lock"></i> Lock</button>`
         : '';
       return `
       <div class="view-sheet-goal-row" data-goal-id="${esc(goalId)}" style="padding:10px 0;border-bottom:1px solid var(--border)">
         <strong>${esc(g.title)}</strong> · ${g.weightage}% · ${esc(g.thrustArea)}<br>
         <span style="font-size:12px;color:var(--text-muted)">${uomLabel(g.uomType)} · Target: ${esc(g.targetValue)}</span>
-        ${editBtn}${unlockBtn}
+        ${editBtn}${lockUnlockBtn}
       </div>`;
     }).join('') || '<p>No goals</p>';
     if (body) body.innerHTML = sheetActionsHtml + goalsHTML;
@@ -2841,7 +2925,12 @@ async function renderManagerEffectiveness() {
 function openUnlockRequestModal(goalId, goalTitle) {
   const modal = document.getElementById('unlockRequestModal');
   if (!modal) return;
-  document.getElementById('unlockRequestGoalId').value = goalId;
+  const gid = normalizeId(goalId);
+  if (hasPendingUnlockRequest(gid)) {
+    showToast('You already have a pending unlock request for this goal.', 'warning');
+    return;
+  }
+  document.getElementById('unlockRequestGoalId').value = gid;
   document.getElementById('unlockRequestGoalTitle').textContent = goalTitle;
   document.getElementById('unlockRequestReason').value = '';
   const errEl = document.getElementById('unlockRequestError');
@@ -2860,15 +2949,23 @@ async function submitUnlockRequest() {
     return;
   }
   try {
-    await Goals.requestUnlock(normalizeId(goalId), reason);
+    const gid = normalizeId(goalId);
+    await Goals.requestUnlock(gid, reason);
+    pendingUnlockGoalIds.add(gid);
     closeModal('unlockRequestModal');
     showToast('Unlock request sent to Admin. You\'ll be notified when reviewed.');
+    renderGoals();
     await loadMySheet();
     loadMyUnlockRequests().catch(() => {});
     refreshNotifications().catch(() => {});
   } catch (err) {
-    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
-    showToast(err.message, 'danger');
+    const msg = err.message || 'Failed to submit unlock request';
+    if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+    showToast(msg, 'danger');
+    if (msg.includes('pending unlock request')) {
+      pendingUnlockGoalIds.add(normalizeId(goalId));
+      renderGoals();
+    }
   }
 }
 
@@ -2878,6 +2975,11 @@ async function loadMyUnlockRequests({ silent = false } = {}) {
   if (!silent) container.innerHTML = '<p style="color:var(--text-muted);padding:8px">Loading...</p>';
   try {
     const { requests } = await Goals.myUnlockRequests();
+    pendingUnlockGoalIds = new Set(
+      (requests || [])
+        .filter((r) => r.status === 'pending')
+        .map((r) => normalizeId(r.goal?._id || r.goal)),
+    );
     if (!requests.length) {
       container.innerHTML = '<p style="color:var(--text-muted);padding:8px">No unlock requests yet.</p>';
       return;
@@ -3060,6 +3162,7 @@ window.openEditGoal = openEditGoal;
 window.saveEditGoal = saveEditGoal;
 window.deleteGoal = deleteGoal;
 window.unlockGoal = unlockGoal;
+window.lockGoal = lockGoal;
 window.approveSheet = approveSheet;
 window.returnSheet = returnSheet;
 window.viewSheetGoals = viewSheetGoals;
@@ -3085,6 +3188,7 @@ window.setManagerQuarter = setManagerQuarter;
 window.loadManagerDashboard = loadManagerDashboard;
 window.loadAdminEmployeeGoals = loadAdminEmployeeGoals;
 window.unlockGoalAndRefresh = unlockGoalAndRefresh;
+window.lockGoalAndRefresh = lockGoalAndRefresh;
 window.openUnlockRequestModal = openUnlockRequestModal;
 window.submitUnlockRequest = submitUnlockRequest;
 window.loadMyUnlockRequests = loadMyUnlockRequests;
