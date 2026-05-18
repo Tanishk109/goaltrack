@@ -1303,7 +1303,7 @@
         <div class="card">
           <div class="card-header">
             <span class="card-title">📋 My Goals</span>
-            <button class="btn btn-primary btn-sm" onclick="showModal('addGoalModal')">
+            <button class="btn btn-primary btn-sm" data-add-goal-btn onclick="showModal('addGoalModal')">
               <i class="fa fa-plus"></i> Add Goal
             </button>
           </div>
@@ -1392,6 +1392,7 @@
         <h2 style="font-size:18px;font-weight:700;margin:0">My Goal Sheet</h2>
         <span id="sheetStatusBadge" class="status-badge status-draft" style="display:none">Draft</span>
       </div>
+      <div id="goalSheetLockNotice" class="alert alert-warning" style="display:none;margin-bottom:16px"></div>
       <div id="sheetReturnNote" class="alert alert-warning" style="display:none;margin-bottom:16px">
         <i class="fa fa-exclamation-triangle"></i>
         <span id="sheetReturnNoteText"></span>
@@ -1417,7 +1418,7 @@
         <div class="card-header">
           <span class="card-title">My Goal Sheet</span>
           <div style="display:flex;gap:8px">
-            <button class="btn btn-outline btn-sm" onclick="showModal('addGoalModal')">
+            <button class="btn btn-outline btn-sm" data-add-goal-btn onclick="showModal('addGoalModal')">
               <i class="fa fa-plus"></i> Add Goal
             </button>
             <button class="btn btn-success btn-sm" onclick="submitGoals()">

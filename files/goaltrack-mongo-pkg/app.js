@@ -89,6 +89,16 @@ function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function escAttr(s) {
+  return esc(s).replace(/'/g, '&#39;');
+}
+
+function normalizeId(id) {
+  if (id == null) return '';
+  if (typeof id === 'object' && id.$oid) return String(id.$oid);
+  return String(id);
+}
+
 function uomLabel(uom) {
   return { min: 'Numeric (Min)', max: 'Numeric (Max)', percent: '%', timeline: 'Timeline', zero: 'Zero-based' }[uom] || uom;
 }
@@ -465,6 +475,23 @@ function renderGoals() {
 
   const submitBtn = document.querySelector('#pg-employee-goals .btn-success');
   if (submitBtn) submitBtn.disabled = !editable || goals.length === 0;
+
+  document.querySelectorAll('[data-add-goal-btn]').forEach((btn) => {
+    btn.style.display = editable ? '' : 'none';
+  });
+  const lockNotice = document.getElementById('goalSheetLockNotice');
+  if (lockNotice) {
+    if (!editable && currentSheet) {
+      const msgs = {
+        approved: 'This goal sheet is approved and locked. Contact your manager or HR to request changes.',
+        submitted: 'This sheet is submitted and awaiting approval. You cannot add or edit goals until it is returned.',
+      };
+      lockNotice.innerHTML = `<i class="fa fa-lock"></i> ${msgs[currentSheet.status] || 'Goal sheet is not editable in its current status.'}`;
+      lockNotice.style.display = 'flex';
+    } else {
+      lockNotice.style.display = 'none';
+    }
+  }
 }
 
 function renderAchievements() {
@@ -489,6 +516,15 @@ async function addGoal() {
   const errEl = document.getElementById('addGoalModalError');
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
 
+  if (!canEditGoals()) {
+    const msg = currentSheet?.status === 'approved'
+      ? 'Your goal sheet is approved and locked. Ask HR to unlock specific goals if changes are needed.'
+      : 'You cannot add goals while the sheet is submitted for approval.';
+    showToast(msg, 'danger');
+    if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+    return;
+  }
+
   const thrustArea = document.getElementById('gThrustArea').value.trim();
   const title = document.getElementById('gTitle').value.trim();
   const description = document.getElementById('gDesc').value.trim();
@@ -508,14 +544,15 @@ async function addGoal() {
     showToast('Maximum 8 goals allowed.', 'danger');
     return;
   }
-  if (!currentSheet?._id) {
+  const sheetId = normalizeId(currentSheet?._id || currentSheetId);
+  if (!sheetId) {
     showToast('No goal sheet loaded. Please refresh the page.', 'danger');
     return;
   }
 
   try {
     await Goals.add({
-      sheet_id: currentSheet._id,
+      sheet_id: sheetId,
       thrustArea,
       title,
       description,
@@ -675,10 +712,15 @@ async function unlockGoal(id) {
 }
 
 async function unlockGoalAndRefresh(goalId) {
+  const gid = normalizeId(goalId);
+  if (!gid) {
+    showToast('Invalid goal.', 'danger');
+    return;
+  }
   const reason = prompt('Reason for unlocking:');
   if (reason === null) return;
   try {
-    await Goals.unlock(goalId, reason || 'Admin unlock');
+    await Goals.unlock(gid, reason || 'Admin unlock');
     showToast('Goal unlocked.');
     await viewSheetGoals(viewSheetContext.sheetId, viewSheetContext.employeeName);
     const page = getActivePageId();
@@ -885,16 +927,24 @@ async function returnSheet(sheetId) {
 }
 
 async function viewSheetGoals(sheetId, employeeName) {
-  viewSheetContext = { sheetId, employeeName };
+  const sid = normalizeId(sheetId);
+  if (!sid) {
+    showToast('Invalid goal sheet.', 'danger');
+    return;
+  }
+  viewSheetContext = { sheetId: sid, employeeName: employeeName || 'Employee' };
   const body = document.getElementById('viewSheetBody');
+  const titleEl = document.getElementById('viewSheetTitle');
   if (body) body.innerHTML = LOADING_HTML;
+  if (titleEl) titleEl.textContent = `Goals — ${employeeName || 'Employee'}`;
+  showModal('viewSheetModal');
   try {
-    const { goals: gs, totalWeightage: tw, sheet } = await Goals.getSheet(sheetId);
+    const { goals: gs, totalWeightage: tw, sheet } = await Goals.getSheet(sid);
     const canInlineEdit = currentRole === 'manager'
       ? sheet?.status === 'submitted'
       : currentRole === 'admin';
-    document.getElementById('viewSheetTitle').textContent = `Goals — ${employeeName} (${tw}% total)`;
-    const sheetIdStr = String(sheetId);
+    if (titleEl) titleEl.textContent = `Goals — ${employeeName || 'Employee'} (${tw}% total)`;
+    const sheetIdStr = sid;
     let sheetActionsHtml = '';
     if (currentRole === 'admin' && sheet?.status === 'submitted') {
       sheetActionsHtml = `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
@@ -911,12 +961,13 @@ async function viewSheetGoals(sheetId, employeeName) {
       </p>`;
     }
     const goalsHTML = (gs || []).map((g) => {
-      const goalId = String(g._id || g.id);
+      const goalId = normalizeId(g._id || g.id);
+      const targetEnc = encodeURIComponent(String(g.targetValue ?? ''));
       const editBtn = canInlineEdit
-        ? `<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px" onclick="toggleInlineEdit(this, '${goalId}', ${g.weightage}, ${JSON.stringify(String(g.targetValue ?? ''))})"><i class="fa fa-pencil"></i> Edit</button>`
+        ? `<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px" data-inline-edit="1" data-goal-id="${escAttr(goalId)}" data-weightage="${g.weightage}" data-target="${escAttr(targetEnc)}"><i class="fa fa-pencil"></i> Edit</button>`
         : '';
       const unlockBtn = (currentRole === 'admin' && g.locked)
-        ? `<button type="button" class="btn btn-warning btn-sm" style="margin-top:8px;margin-left:4px" onclick="unlockGoalAndRefresh('${goalId}')"><i class="fa fa-lock-open"></i> Unlock</button>`
+        ? `<button type="button" class="btn btn-warning btn-sm" style="margin-top:8px;margin-left:4px" data-unlock-goal="${escAttr(goalId)}"><i class="fa fa-lock-open"></i> Unlock</button>`
         : '';
       return `
       <div class="view-sheet-goal-row" data-goal-id="${esc(goalId)}" style="padding:10px 0;border-bottom:1px solid var(--border)">
@@ -925,11 +976,33 @@ async function viewSheetGoals(sheetId, employeeName) {
         ${editBtn}${unlockBtn}
       </div>`;
     }).join('') || '<p>No goals</p>';
-    document.getElementById('viewSheetBody').innerHTML = sheetActionsHtml + goalsHTML;
-    showModal('viewSheetModal');
+    if (body) body.innerHTML = sheetActionsHtml + goalsHTML;
   } catch (err) {
     showToast(err.message, 'danger');
+    if (body) {
+      body.innerHTML = `<p style="color:var(--danger);padding:12px"><i class="fa fa-exclamation-circle"></i> ${esc(err.message || 'Failed to load goal sheet')}</p>`;
+    }
   }
+}
+
+function bindViewSheetBodyActions() {
+  const body = document.getElementById('viewSheetBody');
+  if (!body || body.dataset.actionsBound) return;
+  body.dataset.actionsBound = '1';
+  body.addEventListener('click', (e) => {
+    const unlockBtn = e.target.closest('[data-unlock-goal]');
+    if (unlockBtn) {
+      unlockGoalAndRefresh(unlockBtn.getAttribute('data-unlock-goal'));
+      return;
+    }
+    const editBtn = e.target.closest('[data-inline-edit]');
+    if (editBtn) {
+      const goalId = editBtn.getAttribute('data-goal-id');
+      const weightage = parseInt(editBtn.getAttribute('data-weightage'), 10);
+      const target = decodeURIComponent(editBtn.getAttribute('data-target') || '');
+      toggleInlineEdit(editBtn, goalId, weightage, target);
+    }
+  });
 }
 
 function toggleInlineEdit(btn, goalId, currentWeightage, currentTarget) {
@@ -1208,22 +1281,22 @@ async function loadAdminEmployeeGoals() {
     tbody.innerHTML = allSheets.map((p) => {
       const status = p._status || 'submitted';
       const cssClass = statusCssMap[status] || 'status-draft';
-      const nameJson = JSON.stringify(p.employeeName);
-      const sid = p.sheetId;
+      const sid = normalizeId(p.sheetId);
+      const empName = escAttr(p.employeeName || '');
       let actionBtns = [];
       if (sid) {
         actionBtns.push(
-          `<button class="btn btn-outline btn-sm" onclick="viewSheetGoals('${sid}', ${nameJson})"><i class="fa fa-eye"></i> View & Edit</button>`,
+          `<button type="button" class="btn btn-outline btn-sm" data-sheet-action="view" data-sheet-id="${escAttr(sid)}" data-employee-name="${empName}"><i class="fa fa-eye"></i> View & Edit</button>`,
         );
         if (currentRole === 'admin' && status === 'approved') {
           actionBtns.push(
-            `<button class="btn btn-warning btn-sm" onclick="viewSheetGoals('${sid}', ${nameJson})"><i class="fa fa-lock-open"></i> Unlock Goals</button>`,
+            `<button type="button" class="btn btn-warning btn-sm" data-sheet-action="unlock" data-sheet-id="${escAttr(sid)}" data-employee-name="${empName}"><i class="fa fa-lock-open"></i> Unlock Goals</button>`,
           );
         }
         if (currentRole === 'admin' && status === 'submitted') {
           actionBtns.push(
-            `<button class="btn btn-success btn-sm" onclick="approveSheet('${sid}')"><i class="fa fa-check"></i> Approve</button>`,
-            `<button class="btn btn-warning btn-sm" onclick="returnSheet('${sid}')"><i class="fa fa-undo"></i> Return</button>`,
+            `<button type="button" class="btn btn-success btn-sm" data-sheet-action="approve" data-sheet-id="${escAttr(sid)}"><i class="fa fa-check"></i> Approve</button>`,
+            `<button type="button" class="btn btn-warning btn-sm" data-sheet-action="return" data-sheet-id="${escAttr(sid)}"><i class="fa fa-undo"></i> Return</button>`,
           );
         }
       }
@@ -1239,11 +1312,30 @@ async function loadAdminEmployeeGoals() {
         <td>${actions}</td>
       </tr>`;
     }).join('');
+    bindAdminEmployeeSheetsTable();
   } catch (err) {
     showToast(err.message, 'danger');
     const tbody = document.getElementById('adminEmployeeSheetsTable');
     if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px">Unable to load</td></tr>';
   }
+}
+
+function bindAdminEmployeeSheetsTable() {
+  const tbody = document.getElementById('adminEmployeeSheetsTable');
+  if (!tbody || tbody.dataset.bound) return;
+  tbody.dataset.bound = '1';
+  tbody.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-sheet-action]');
+    if (!btn) return;
+    e.preventDefault();
+    const action = btn.getAttribute('data-sheet-action');
+    const sheetId = normalizeId(btn.getAttribute('data-sheet-id'));
+    const name = btn.getAttribute('data-employee-name') || 'Employee';
+    if (!sheetId) return;
+    if (action === 'view' || action === 'unlock') viewSheetGoals(sheetId, name);
+    else if (action === 'approve') approveSheet(sheetId);
+    else if (action === 'return') returnSheet(sheetId);
+  });
 }
 
 function renderAdminStats(dash, activeEscalations = 0, teamCheckins = []) {
@@ -2136,6 +2228,8 @@ function initThemes() {
 
 async function initApp() {
   initThemes();
+  bindViewSheetBodyActions();
+  bindAdminEmployeeSheetsTable();
   const checkinEmp = document.getElementById('checkinEmployee');
   if (checkinEmp) checkinEmp.addEventListener('change', updateCheckinGoals);
 

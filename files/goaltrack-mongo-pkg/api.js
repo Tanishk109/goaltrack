@@ -1,7 +1,11 @@
 // api.js — GoalTrack Pro API client
-const API_BASE = (typeof location !== 'undefined' && location.port === '3000')
-  ? '/api'
-  : 'http://localhost:3000/api';
+const API_BASE = (() => {
+  if (typeof location === 'undefined') return 'https://goaltrack-36ze.onrender.com/api';
+  const { hostname, port } = location;
+  if (port === '3000' || hostname === 'goaltrack-36ze.onrender.com') return '/api';
+  if (hostname === 'localhost' || hostname === '127.0.0.1') return 'http://localhost:3000/api';
+  return 'https://goaltrack-36ze.onrender.com/api';
+})();
 
 async function apiFetch(path, options = {}) {
   const token = localStorage.getItem('gt_token');
