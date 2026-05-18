@@ -107,12 +107,50 @@ const CheckInSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-const AuditLogModel   = mongoose.model('AuditLog', AuditLogSchema);
-const EscalationModel = mongoose.model('Escalation', EscalationSchema);
-const CheckInModel    = mongoose.model('CheckIn', CheckInSchema);
+// ─── UnlockRequest model ──────────────────────────────────────────────────────
+const UnlockRequestSchema = new mongoose.Schema({
+  goal: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Goal',
+    required: true,
+  },
+  employee: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+  },
+  reason: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  status: {
+    type: String,
+    enum: ['pending', 'approved', 'rejected'],
+    default: 'pending',
+  },
+  resolvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  resolvedAt: Date,
+  adminNote: String,
+}, {
+  timestamps: true,
+});
+
+UnlockRequestSchema.index({ employee: 1, status: 1 });
+UnlockRequestSchema.index({ status: 1, createdAt: -1 });
+
+const AuditLogModel        = mongoose.model('AuditLog', AuditLogSchema);
+const EscalationModel      = mongoose.model('Escalation', EscalationSchema);
+const CheckInModel         = mongoose.model('CheckIn', CheckInSchema);
+const UnlockRequestModel   = mongoose.model('UnlockRequest', UnlockRequestSchema);
 
 // Default export is AuditLog; named models attached as properties.
 // Do NOT reassign module.exports after this block.
 module.exports = AuditLogModel;
-module.exports.Escalation = EscalationModel;
-module.exports.CheckIn    = CheckInModel;
+module.exports.Escalation     = EscalationModel;
+module.exports.CheckIn        = CheckInModel;
+module.exports.UnlockRequest  = UnlockRequestModel;

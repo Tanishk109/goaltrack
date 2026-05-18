@@ -3,6 +3,7 @@ const express = require('express');
 const { Goal, GoalSheet } = require('../models/Goal');
 const Cycle    = require('../models/Cycle');
 const { authenticate, authorize, logAudit } = require('../middleware/auth');
+const { UnlockRequest } = require('../models/AuditLog');
 
 const router = express.Router();
 
@@ -16,6 +17,12 @@ async function getOrCreateSheet(userId, cycleId) {
 }
 
 // ─── Helper: total weightage for a sheet ────────────────────────────────────
+function isGoalLocked(goal) {
+  const sheet = goal.sheet;
+  if (sheet?.status === 'approved') return goal.locked !== false;
+  return !!goal.locked;
+}
+
 async function getTotalWeightage(sheetId, excludeGoalId = null) {
   const match = { sheet: sheetId };
   if (excludeGoalId) match._id = { $ne: excludeGoalId };
@@ -120,8 +127,10 @@ router.patch('/:id', authenticate, async (req, res) => {
     if (req.user.role === 'employee') {
       if (String(goal.sheet.user) !== String(req.user._id))
         return res.status(403).json({ error: 'Not your goal.' });
-      if (goal.locked) return res.status(403).json({ error: 'Goal is locked. Ask admin to unlock.' });
-      if (goal.sheet.status === 'approved') return res.status(403).json({ error: 'Sheet is approved and locked.' });
+      if (goal.sheet.status === 'submitted')
+        return res.status(403).json({ error: 'Sheet is submitted for approval.' });
+      if (isGoalLocked(goal))
+        return res.status(403).json({ error: 'Goal is locked. Request an unlock from Admin/HR.' });
     }
 
     const { weightage } = req.body;
@@ -313,6 +322,153 @@ router.post('/push-shared', authenticate, authorize('admin', 'manager'), async (
       results,
       skipped,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/goals/unlock-request/:goal_id — Employee requests unlock ───────
+router.post('/unlock-request/:goal_id', authenticate, authorize('employee'), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ error: 'A reason is required for the unlock request.' });
+    }
+
+    const goal = await Goal.findById(req.params.goal_id).populate('sheet');
+    if (!goal) return res.status(404).json({ error: 'Goal not found.' });
+
+    if (String(goal.sheet.user) !== String(req.user._id)) {
+      return res.status(403).json({ error: 'Not your goal.' });
+    }
+
+    if (!isGoalLocked(goal)) {
+      return res.status(400).json({ error: 'This goal is not locked.' });
+    }
+
+    const existing = await UnlockRequest.findOne({
+      goal: goal._id,
+      employee: req.user._id,
+      status: 'pending',
+    });
+    if (existing) {
+      return res.status(409).json({ error: 'You already have a pending unlock request for this goal.' });
+    }
+
+    const request = await UnlockRequest.create({
+      goal:     goal._id,
+      employee: req.user._id,
+      reason:   reason.trim(),
+    });
+
+    logAudit(
+      req.user._id,
+      'UNLOCK_REQUESTED',
+      'goal',
+      goal._id,
+      null,
+      { reason: reason.trim(), goalTitle: goal.title },
+      req.ip,
+    );
+
+    res.status(201).json({ message: 'Unlock request submitted. Admin will review it.', request });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/goals/unlock-requests — Admin sees all pending requests ─────────
+router.get('/unlock-requests', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const filter = req.query.all === '1' ? {} : { status: 'pending' };
+    const requests = await UnlockRequest.find(filter)
+      .populate('goal', 'title thrustArea targetValue weightage locked')
+      .populate('employee', 'name email department')
+      .populate('resolvedBy', 'name')
+      .sort({ createdAt: -1 })
+      .limit(100);
+
+    res.json({ requests });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/goals/my-unlock-requests — Employee sees their own requests ──────
+router.get('/my-unlock-requests', authenticate, authorize('employee'), async (req, res) => {
+  try {
+    const requests = await UnlockRequest.find({ employee: req.user._id })
+      .populate('goal', 'title thrustArea locked')
+      .populate('resolvedBy', 'name')
+      .sort({ createdAt: -1 });
+
+    res.json({ requests });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PATCH /api/goals/unlock-requests/:id/approve — Admin approves ───────────
+router.patch('/unlock-requests/:id/approve', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { adminNote } = req.body;
+    const unlockReq = await UnlockRequest.findById(req.params.id).populate('goal');
+    if (!unlockReq) return res.status(404).json({ error: 'Unlock request not found.' });
+    if (unlockReq.status !== 'pending') {
+      return res.status(400).json({ error: `Request is already ${unlockReq.status}.` });
+    }
+
+    await Goal.findByIdAndUpdate(unlockReq.goal._id, { $set: { locked: false } });
+
+    unlockReq.status     = 'approved';
+    unlockReq.resolvedBy = req.user._id;
+    unlockReq.resolvedAt = new Date();
+    unlockReq.adminNote  = adminNote || 'Approved.';
+    await unlockReq.save();
+
+    logAudit(
+      req.user._id,
+      'GOAL_UNLOCKED',
+      'goal',
+      unlockReq.goal._id,
+      { locked: true },
+      { locked: false, reason: `Unlock request approved. ${adminNote || ''}` },
+      req.ip,
+    );
+
+    res.json({ message: 'Unlock request approved. Goal is now unlocked.', request: unlockReq });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PATCH /api/goals/unlock-requests/:id/reject — Admin rejects ─────────────
+router.patch('/unlock-requests/:id/reject', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { adminNote } = req.body;
+    const unlockReq = await UnlockRequest.findById(req.params.id);
+    if (!unlockReq) return res.status(404).json({ error: 'Unlock request not found.' });
+    if (unlockReq.status !== 'pending') {
+      return res.status(400).json({ error: `Request is already ${unlockReq.status}.` });
+    }
+
+    unlockReq.status     = 'rejected';
+    unlockReq.resolvedBy = req.user._id;
+    unlockReq.resolvedAt = new Date();
+    unlockReq.adminNote  = adminNote || 'Request rejected.';
+    await unlockReq.save();
+
+    logAudit(
+      req.user._id,
+      'UNLOCK_REQUEST_REJECTED',
+      'goal',
+      unlockReq.goal,
+      null,
+      { adminNote: unlockReq.adminNote },
+      req.ip,
+    );
+
+    res.json({ message: 'Unlock request rejected.', request: unlockReq });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
